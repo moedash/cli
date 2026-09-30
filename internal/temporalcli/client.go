@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/user"
+	"sync/atomic"
 
 	"github.com/temporalio/cli/cliext"
 	"go.temporal.io/api/common/v1"
@@ -32,8 +33,30 @@ func dialClient(cctx *CommandContext, c *cliext.ClientOptions) (client.Client, e
 // used by the gRPC interceptor; callers can use it to decode payloads nested inside
 // opaque proto bytes (e.g. the request/response of a system Nexus operation).
 func dialClientWithCodec(cctx *CommandContext, c *cliext.ClientOptions) (client.Client, converter.PayloadCodec, error) {
+	cl, err := dialClientWithConn(cctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cl.Client, cl.PayloadCodec, nil
+}
+
+// dialedClient is an SDK client together with what the SDK dialed for it.
+type dialedClient struct {
+	client.Client
+	// The connection the SDK dialed, carrying its TLS, credentials, headers and
+	// interceptors, for services the SDK client does not wrap.
+	Conn grpc.ClientConnInterface
+	// As returned by [dialClientWithCodec]. The interceptor applying it walks
+	// the public API's messages only, so payloads inside any other message are
+	// encoded and decoded by hand.
+	PayloadCodec converter.PayloadCodec
+}
+
+// dialClientWithConn is like [dialClient] but also returns the connection the
+// SDK dialed and the remote payload codec.
+func dialClientWithConn(cctx *CommandContext, c *cliext.ClientOptions) (*dialedClient, error) {
 	if cctx.RootCommand == nil {
-		return nil, nil, fmt.Errorf("root command unexpectedly missing when dialing client")
+		return nil, fmt.Errorf("root command unexpectedly missing when dialing client")
 	}
 
 	// Set default identity if not provided
@@ -61,12 +84,12 @@ func dialClientWithCodec(cctx *CommandContext, c *cliext.ClientOptions) (client.
 		// original setup error instead of attaching a guessed address or profile.
 		var pathErr *fs.PathError
 		if errors.As(err, &pathErr) {
-			return nil, nil, newConnectError(&connectDiagnosis{
+			return nil, newConnectError(&connectDiagnosis{
 				Cause:  causeCertFileUnreadable,
 				Detail: pathErr.Path,
 			}, connectMeta{}, err)
 		}
-		return nil, nil, err
+		return nil, err
 	}
 
 	// We do not put codec on data converter here, it is applied via
@@ -81,6 +104,20 @@ func dialClientWithCodec(cctx *CommandContext, c *cliext.ClientOptions) (client.
 	// Fixed header overrides
 	clientOpts.ConnectionOptions.DialOptions = append(
 		clientOpts.ConnectionOptions.DialOptions, grpc.WithChainUnaryInterceptor(fixedHeaderOverrideInterceptor))
+
+	// The SDK does not hand out the connection it dials, but every interceptor
+	// on it is given the connection, and the dial itself makes a call.
+	var conn atomic.Pointer[grpc.ClientConn]
+	clientOpts.ConnectionOptions.DialOptions = append(
+		clientOpts.ConnectionOptions.DialOptions, grpc.WithChainUnaryInterceptor(
+			func(
+				ctx context.Context,
+				method string, req, reply any,
+				cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption,
+			) error {
+				conn.CompareAndSwap(nil, cc)
+				return invoker(ctx, method, req, reply, cc, opts...)
+			}))
 
 	// Additional gRPC options
 	clientOpts.ConnectionOptions.DialOptions = append(
@@ -97,14 +134,19 @@ func dialClientWithCodec(cctx *CommandContext, c *cliext.ClientOptions) (client.
 
 	cl, err := client.DialContext(dialCtx, clientOpts)
 	if err != nil {
-		return nil, nil, dialConnectError(cctx, dialCtx, clientOpts, err)
+		return nil, dialConnectError(cctx, dialCtx, clientOpts, err)
 	}
 
 	// Since this namespace value is used by many commands after this call,
 	// we are mutating it to be the derived one
 	c.Namespace = clientOpts.Namespace
 
-	return cl, builder.PayloadCodec, nil
+	cc := conn.Load()
+	if cc == nil {
+		cl.Close()
+		return nil, fmt.Errorf("dialing made no call, so the connection was not captured")
+	}
+	return &dialedClient{Client: cl, Conn: cc, PayloadCodec: builder.PayloadCodec}, nil
 }
 
 // dialConnectError enriches a client.DialContext failure with a staged
