@@ -1,0 +1,101 @@
+# `temporal stream`
+
+Streams are append-only logs the Temporal Service carries next to Workflow
+Executions. This fork adds a `temporal stream` command group on top of the
+stream service, and a dev server that serves it.
+
+## Dev server
+
+`temporal server start-dev` registers the stream service and turns it on for
+every namespace it creates. The server ships with `stream.enabled` off, so the
+dev server sets it as one of its own dynamic-config defaults, the same way it
+sets the CHASM and standalone-activity flags. An explicit value still wins:
+
+```sh
+temporal server start-dev --dynamic-config-value 'stream.enabled=false'
+```
+
+The server behind the dev server is pinned in `go.mod` to the stream branch of
+`moedash/temporal`, with the matching `moedash/api-go` pin the server needs.
+
+## Addressing a stream
+
+Two kinds of stream exist. A standalone stream has an ID of its own. An owned
+stream lives inside a Workflow Execution or an Activity and is named by its
+owner and a stream name.
+
+- `--stream-id ID`: the standalone stream `ID`.
+- `--workflow-id W [--run-id R] [--name N]`: the stream `N` the workflow owns.
+  Without `--name` it is the workflow's default stream.
+- `--workflow-id W --activity-id A [--name N]`: the stream of an activity the
+  workflow scheduled.
+- `--activity-id A [--run-id R] [--name N]`: the stream of a standalone
+  activity.
+
+`describe`, `read` and `append` take either form. `create`, `close`,
+`truncate` and `delete` act on a standalone stream only, because an owned
+stream's lifecycle is its owner's.
+
+## Commands
+
+`stream create --stream-id ID [--retention D] [--max-items N]`
+: Creates a standalone stream. Retention defaults to the namespace's.
+
+`stream list [--query Q] [--limit N] [--page-size N]`
+: Lists standalone streams from visibility. `WorkflowId` in the query is the
+  stream ID. Owned streams are not listed; reach them through their owner.
+
+`stream describe <ref>`
+: Frontier, floor, readable record count, close state and reason, retention,
+  budget, producers and consumers.
+
+`stream read <ref> [--from-offset N | --from-tail | --last N] [--follow]
+[--topic T]... [--limit N]`
+: Prints records with offset, kind, topic, producer, attempt, sequence and
+  body. Stops once caught up, or with `--follow` when the stream closes.
+
+`stream append <ref> --input V... [--topic T] [--producer-id P] [--attempt A]
+[--sequence S] [--expected-offset N] [--finish]`
+: Appends one record per `--input` or `--input-file`, or per line of stdin.
+  `--producer-id` with `--sequence` deduplicates a retry. `--finish` adds a
+  `FINISH` record after the values.
+
+`stream close --stream-id ID [--reason R]`
+: Seals the stream. Records stay readable until retention passes.
+
+`stream truncate --stream-id ID --to N`
+: Moves the floor to `N`. Refused below an active consumer's floor.
+
+`stream delete --stream-id ID [--force]`
+: Deletes the stream and its records. Refused while a workflow consumes it,
+  unless forced.
+
+`--output json` prints one JSON object per record or list entry, and the
+stream state proto for `describe`.
+
+Authorization follows the server's declaration: `truncate` and `delete` need
+the admin role on the namespace, `list`, `describe` and `read` the read role,
+and the rest the write role.
+
+## Payload codec
+
+The records' bodies and metadata go through the same remote codec as every
+other payload the CLI shows or sends, configured with `--codec-endpoint`,
+`--codec-auth` and `--codec-header`. The gRPC interceptor that applies the
+codec walks only the public API's messages, so the stream commands apply it by
+hand on the records and on a close reason.
+
+## Examples
+
+```sh
+temporal server start-dev --port 7533
+
+temporal stream create --address localhost:7533 --stream-id scores
+temporal stream append --address localhost:7533 --stream-id scores \
+    --producer-id game --sequence 1 --input '{"home": 1}' --input '{"home": 2}'
+temporal stream read --address localhost:7533 --stream-id scores --follow
+temporal stream describe --address localhost:7533 --stream-id scores
+
+temporal stream read --address localhost:7533 \
+    --workflow-id june-s1-abcdef12 --name scores
+```
