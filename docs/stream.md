@@ -38,16 +38,20 @@ stream's lifecycle is its owner's.
 
 ## Commands
 
-`stream create --stream-id ID [--retention D] [--max-items N]`
-: Creates a standalone stream. Retention defaults to the namespace's.
+`stream create --stream-id ID [--retention D] [--max-items N] [--max-bytes N]`
+: Creates a standalone stream. Retention defaults to the namespace's; records
+  older than it are reclaimed. `--max-items` is a rolling window on records,
+  `--max-bytes` a ceiling on held bytes that refuses appends until records
+  are reclaimed. Repeating a create with the same lifecycle answers "already
+  exists"; a different lifecycle is refused.
 
 `stream list [--query Q] [--limit N] [--page-size N]`
 : Lists standalone streams from visibility. `WorkflowId` in the query is the
   stream ID. Owned streams are not listed; reach them through their owner.
 
 `stream describe <ref>`
-: Frontier, floor, readable record count, close state and reason, retention,
-  budget, producers and consumers.
+: Frontier, floor, readable record count, held and appended bytes, close
+  state and reason, retention, caps, budget, producers and consumers.
 
 `stream read <ref> [--from-offset N | --from-tail | --last N] [--follow]
 [--topic T]... [--limit N]`
@@ -76,6 +80,23 @@ stream state proto for `describe`.
 Authorization follows the server's declaration: `truncate` and `delete` need
 the admin role on the namespace, `list`, `describe` and `read` the read role,
 and the rest the write role.
+
+## Refusals
+
+A refusal the caller has to act on comes back from the server as a
+`FailedPrecondition` whose message starts with a reason token. `create`,
+`read` and `append` read the token and print what to do instead of the token,
+with the server's own detail after it:
+
+- `STREAM_PRODUCER_CONFLICT`: the producer already appended different content
+  at this sequence; nothing was written.
+- `STREAM_PRODUCER_STALE_SEQUENCE`: the sequence is below the producer's
+  latest; nothing was written.
+- `STREAM_CURSOR_BELOW_FLOOR`: the read starts below the floor; those records
+  are gone.
+- `STREAM_CLOSED`: the stream is closed; its records stay readable.
+- `STREAM_POLICY_MISMATCH`: a stream with this id exists with a different
+  lifecycle.
 
 ## Payload codec
 

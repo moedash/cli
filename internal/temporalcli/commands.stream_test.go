@@ -40,14 +40,27 @@ func (s *SharedServerSuite) readStreamJSON(args ...string) []*streampb.StreamRec
 
 func (s *SharedServerSuite) TestStream_StandaloneLifecycle() {
 	id := "stream-" + uuid.NewString()
-	s.createStream(id, "--retention", "1h")
+	s.createStream(id, "--retention", "1h", "--max-bytes", "1048576")
+
+	// The same lifecycle again is a retry; a different one is refused.
+	res := s.Execute(
+		"stream", "create", "--address", s.Address(), "--stream-id", id,
+		"--retention", "1h", "--max-bytes", "1048576",
+	)
+	s.ErrorContains(res.Err, "already exists")
+	res = s.Execute(
+		"stream", "create", "--address", s.Address(), "--stream-id", id,
+		"--retention", "1h", "--max-bytes", "2048",
+	)
+	s.ErrorContains(res.Err, "different lifecycle")
+	s.NotContains(res.Err.Error(), "STREAM_POLICY_MISMATCH")
 
 	appendArgs := []string{
 		"stream", "append", "--address", s.Address(), "--stream-id", id,
 		"--topic", "scores", "--producer-id", "p1", "--attempt", "1", "--sequence", "1",
 		"--input", `{"home": 1}`, "--input", `{"home": 2}`,
 	}
-	res := s.Execute(appendArgs...)
+	res = s.Execute(appendArgs...)
 	s.NoError(res.Err)
 	s.ContainsOnSameLine(res.Stdout.String(), "FirstOffset", "0")
 	s.ContainsOnSameLine(res.Stdout.String(), "NextOffset", "2")
@@ -57,6 +70,21 @@ func (s *SharedServerSuite) TestStream_StandaloneLifecycle() {
 	res = s.Execute(appendArgs...)
 	s.NoError(res.Err)
 	s.ContainsOnSameLine(res.Stdout.String(), "Deduplicated", "true")
+
+	// Different content at that sequence is a conflict, and an older sequence
+	// is stale; both are refused in plain words, without the token.
+	res = s.Execute(
+		"stream", "append", "--address", s.Address(), "--stream-id", id,
+		"--producer-id", "p1", "--sequence", "1", "--input", `{"home": 9}`,
+	)
+	s.ErrorContains(res.Err, "different content at this sequence")
+	s.NotContains(res.Err.Error(), "STREAM_PRODUCER_CONFLICT")
+	res = s.Execute(
+		"stream", "append", "--address", s.Address(), "--stream-id", id,
+		"--producer-id", "p1", "--sequence", "0", "--input", `{"home": 9}`,
+	)
+	s.ErrorContains(res.Err, "below the producer's latest")
+	s.NotContains(res.Err.Error(), "STREAM_PRODUCER_STALE_SEQUENCE")
 
 	// One record per stdin line, then the producer's FINISH.
 	s.Stdin.WriteString("\"third\"\n\n\"fourth\"\n")
@@ -112,6 +140,8 @@ func (s *SharedServerSuite) TestStream_StandaloneLifecycle() {
 	s.ContainsOnSameLine(out, "StreamId", id)
 	s.ContainsOnSameLine(out, "HeadOffset", "5")
 	s.ContainsOnSameLine(out, "Retention", "1h")
+	s.ContainsOnSameLine(out, "MaxBytes", "1048576")
+	s.ContainsOnSameLine(out, "HeldBytes")
 	s.ContainsOnSameLine(out, "Producers", "2")
 	s.ContainsOnSameLine(out, "p1", "1", "0", "2", "false")
 	// A FINISH record tells readers the producer is done; only FinishWriting
@@ -128,17 +158,28 @@ func (s *SharedServerSuite) TestStream_StandaloneLifecycle() {
 	s.Equal(int64(0), state.GetBaseOffset())
 	s.False(state.GetClosed())
 	s.Equal(int64(3), state.GetProducers()["p2"].GetCount())
+	s.Equal(int64(1048576), state.GetLifecycle().GetMaxBytes())
+	s.Positive(state.GetHeldBytes())
+	s.Equal(state.GetAppendedBytes(), state.GetHeldBytes())
 
-	// Truncation moves the floor; the beginning is now the oldest record left.
+	// Truncation moves the floor; the beginning is now the oldest record left,
+	// and the reclaimed batch no longer counts as held.
 	res = s.Execute("stream", "truncate", "--address", s.Address(), "--stream-id", id, "--to", "2")
 	s.NoError(res.Err)
 	records = s.readStreamJSON("--stream-id", id)
 	s.Len(records, 3)
 	s.Equal(int64(2), records[0].GetOffset())
+	res = s.Execute("stream", "describe", "--address", s.Address(), "--stream-id", id, "-o", "json")
+	s.NoError(res.Err)
+	var truncated streampb.StreamState
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &truncated, true))
+	s.Equal(int64(2), truncated.GetBaseOffset())
+	s.Less(truncated.GetHeldBytes(), truncated.GetAppendedBytes())
 	res = s.Execute(
 		"stream", "read", "--address", s.Address(), "--stream-id", id, "--from-offset", "0",
 	)
-	s.Error(res.Err)
+	s.ErrorContains(res.Err, "below the stream's floor")
+	s.NotContains(res.Err.Error(), "STREAM_CURSOR_BELOW_FLOOR")
 
 	// Closing seals the stream but keeps it readable.
 	res = s.Execute("stream", "close", "--address", s.Address(), "--stream-id", id, "--reason", "done")
@@ -150,7 +191,8 @@ func (s *SharedServerSuite) TestStream_StandaloneLifecycle() {
 	res = s.Execute(
 		"stream", "append", "--address", s.Address(), "--stream-id", id, "--input", `"late"`,
 	)
-	s.ErrorContains(res.Err, "closed")
+	s.ErrorContains(res.Err, "the stream is closed")
+	s.NotContains(res.Err.Error(), "STREAM_CLOSED")
 	s.Len(s.readStreamJSON("--stream-id", id), 3)
 
 	// Deleting takes the records with it.
@@ -289,4 +331,8 @@ func (s *SharedServerSuite) TestStream_ReferenceValidation() {
 	s.ErrorContains(res.Err, "--expected-offset applies to a standalone stream")
 	res = s.Execute("stream", "truncate", "--address", s.Address(), "--to", "1")
 	s.ErrorContains(res.Err, "stream-id")
+	res = s.Execute(
+		"stream", "create", "--address", s.Address(), "--stream-id", "a", "--max-bytes", "-1",
+	)
+	s.ErrorContains(res.Err, "cannot be negative")
 }

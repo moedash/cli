@@ -3,6 +3,7 @@ package temporalcli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -15,12 +16,66 @@ import (
 	"github.com/temporalio/cli/cliext"
 	"github.com/temporalio/cli/internal/printer"
 	commonpb "go.temporal.io/api/common/v1"
+	"go.temporal.io/api/serviceerror"
 	streamapi "go.temporal.io/api/stream/v1"
 	"go.temporal.io/api/temporalproto"
 	"go.temporal.io/sdk/converter"
+	streamlib "go.temporal.io/server/chasm/lib/stream"
 	streampb "go.temporal.io/server/chasm/lib/stream/gen/streampb/v1"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+// streamRefusal is a server refusal whose reason token has been read, so the
+// message says what to do instead of carrying the token.
+type streamRefusal struct {
+	plain  string
+	detail string
+	cause  error
+}
+
+func (e *streamRefusal) Error() string {
+	if e.detail == "" {
+		return e.plain
+	}
+	return e.plain + " The server said: " + e.detail
+}
+
+func (e *streamRefusal) Unwrap() error { return e.cause }
+
+// plainRefusal maps a refusal's reason token to plain language. Every other
+// error comes back as it was.
+func plainRefusal(err error) error {
+	var refused *serviceerror.FailedPrecondition
+	if !errors.As(err, &refused) {
+		return err
+	}
+	reason := streamlib.ReasonOf(refused.Message)
+	if reason == "" {
+		return err
+	}
+	_, detail, _ := strings.Cut(refused.Message, ": ")
+	var plain string
+	switch reason {
+	case streamlib.ReasonProducerConflict:
+		plain = "the producer already appended different content at this sequence, so " +
+			"nothing was written. Use the next sequence, or check that two producers do not " +
+			"share the id."
+	case streamlib.ReasonProducerStaleSequence:
+		plain = "the sequence is below the producer's latest, so nothing was written. A " +
+			"producer carries one append at a time; retry with its latest sequence or move on " +
+			"to the next."
+	case streamlib.ReasonCursorBelowFloor:
+		plain = "the read starts below the stream's floor, and those records are gone. Start " +
+			"from the beginning, or at the offset the stream now starts at."
+	case streamlib.ReasonStreamClosed:
+		plain = "the stream is closed. Its records stay readable, but nothing more can be " +
+			"appended."
+	case streamlib.ReasonPolicyMismatch:
+		plain = "a stream with this id already exists with a different lifecycle. Use a new " +
+			"id, or repeat the existing retention, max items and max bytes."
+	}
+	return &streamRefusal{plain: plain, detail: detail, cause: err}
+}
 
 // streamTarget is the stream a command names: a standalone stream by its id,
 // or a stream an execution owns by that owner and a name.
@@ -242,8 +297,8 @@ func (s *streamClient) append(
 }
 
 func (c *TemporalStreamCreateCommand) run(cctx *CommandContext, _ []string) error {
-	if c.MaxItems < 0 {
-		return fmt.Errorf("--max-items cannot be negative")
+	if c.MaxItems < 0 || c.MaxBytes < 0 {
+		return fmt.Errorf("--max-items and --max-bytes cannot be negative")
 	}
 	cl, err := dialStreamClient(cctx, &c.Parent.ClientOptions)
 	if err != nil {
@@ -251,7 +306,10 @@ func (c *TemporalStreamCreateCommand) run(cctx *CommandContext, _ []string) erro
 	}
 	defer cl.Close()
 
-	lifecycle := &streampb.StreamLifecycle{MaxItems: int64(c.MaxItems)}
+	lifecycle := &streampb.StreamLifecycle{
+		MaxItems: int64(c.MaxItems),
+		MaxBytes: int64(c.MaxBytes),
+	}
 	if c.Retention.Duration() > 0 {
 		lifecycle.Retention = durationpb.New(c.Retention.Duration())
 	}
@@ -263,7 +321,7 @@ func (c *TemporalStreamCreateCommand) run(cctx *CommandContext, _ []string) erro
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed creating stream %q: %w", c.StreamId, err)
+		return fmt.Errorf("failed creating stream %q: %w", c.StreamId, plainRefusal(err))
 	}
 	if cctx.JSONOutput {
 		return cctx.Printer.PrintStructured(resp.GetFrontendResponse(), printer.StructuredOptions{})
@@ -371,6 +429,7 @@ func (c *TemporalStreamDescribeCommand) run(cctx *CommandContext, _ []string) er
 		HeadOffset     int64
 		BaseOffset     int64
 		Records        int64
+		HeldBytes      int64
 		AppendedBytes  int64
 		Closed         bool
 		CloseTime      time.Time         `cli:",cardOmitEmpty"`
@@ -378,6 +437,7 @@ func (c *TemporalStreamDescribeCommand) run(cctx *CommandContext, _ []string) er
 		RedirectRunId  string            `cli:",cardOmitEmpty"`
 		Retention      time.Duration     `cli:",cardOmitEmpty"`
 		MaxItems       int64             `cli:",cardOmitEmpty"`
+		MaxBytes       int64             `cli:",cardOmitEmpty"`
 		BudgetMaxItems int64             `cli:",cardOmitEmpty"`
 		BudgetMaxBytes int64             `cli:",cardOmitEmpty"`
 	}{
@@ -385,12 +445,14 @@ func (c *TemporalStreamDescribeCommand) run(cctx *CommandContext, _ []string) er
 		HeadOffset:     state.GetHeadOffset(),
 		BaseOffset:     state.GetBaseOffset(),
 		Records:        state.GetHeadOffset() - state.GetBaseOffset(),
+		HeldBytes:      state.GetHeldBytes(),
 		AppendedBytes:  state.GetAppendedBytes(),
 		Closed:         state.GetClosed(),
 		CloseReason:    state.GetCloseReason(),
 		RedirectRunId:  state.GetRedirectRunId(),
 		Retention:      state.GetLifecycle().GetRetention().AsDuration(),
 		MaxItems:       state.GetLifecycle().GetMaxItems(),
+		MaxBytes:       state.GetLifecycle().GetMaxBytes(),
 		BudgetMaxItems: state.GetBudget().GetMaxItems(),
 		BudgetMaxBytes: state.GetBudget().GetMaxBytes(),
 	}
@@ -542,7 +604,7 @@ func (r *streamReader) next() (*streampb.StreamRecord, error) {
 				r.done = true
 				break
 			}
-			return nil, fmt.Errorf("failed reading %v: %w", r.target, err)
+			return nil, fmt.Errorf("failed reading %v: %w", r.target, plainRefusal(err))
 		}
 	}
 	if len(r.buf) == 0 {
@@ -814,7 +876,7 @@ func (c *TemporalStreamAppendCommand) run(cctx *CommandContext, _ []string) erro
 	}
 	out, err := cl.append(cctx, target, records, c.ProducerId, sequence, expectedOffset)
 	if err != nil {
-		return fmt.Errorf("failed appending to %v: %w", target, err)
+		return fmt.Errorf("failed appending to %v: %w", target, plainRefusal(err))
 	}
 	if cctx.JSONOutput {
 		return cctx.Printer.PrintStructured(out, printer.StructuredOptions{})

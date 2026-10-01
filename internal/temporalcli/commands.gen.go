@@ -3014,6 +3014,7 @@ type TemporalStreamCreateCommand struct {
 	StreamIdOptions
 	Retention cliext.FlagDuration
 	MaxItems  int
+	MaxBytes  int
 }
 
 func NewTemporalStreamCreateCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamCreateCommand {
@@ -3023,14 +3024,15 @@ func NewTemporalStreamCreateCommand(cctx *CommandContext, parent *TemporalStream
 	s.Command.Use = "create [flags]"
 	s.Command.Short = "Create a standalone Stream"
 	if hasHighlighting {
-		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n\x1b[1mtemporal stream create \\\n    --stream-id YourStreamId\x1b[0m\n\nA closed Stream is deleted once \x1b[1m--retention\x1b[0m passes. Without it the\nNamespace's retention applies."
+		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n\x1b[1mtemporal stream create \\\n    --stream-id YourStreamId\x1b[0m\n\nRecords older than \x1b[1m--retention\x1b[0m are reclaimed, and a closed Stream is\ndeleted once it passes. Without it the Namespace's retention applies.\nCreating a Stream that already exists with the same lifecycle is an\nidempotent retry; a different lifecycle is refused."
 	} else {
-		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n```\ntemporal stream create \\\n    --stream-id YourStreamId\n```\n\nA closed Stream is deleted once `--retention` passes. Without it the\nNamespace's retention applies."
+		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n```\ntemporal stream create \\\n    --stream-id YourStreamId\n```\n\nRecords older than `--retention` are reclaimed, and a closed Stream is\ndeleted once it passes. Without it the Namespace's retention applies.\nCreating a Stream that already exists with the same lifecycle is an\nidempotent retry; a different lifecycle is refused."
 	}
 	s.Command.Args = cobra.NoArgs
 	s.Retention = 0
-	s.Command.Flags().Var(&s.Retention, "retention", "How long a closed Stream stays readable. Cannot be longer than the Namespace's retention.")
+	s.Command.Flags().Var(&s.Retention, "retention", "How long a record stays readable, and how long a closed Stream stays readable before it is deleted. Cannot be longer than the Namespace's retention.")
 	s.Command.Flags().IntVar(&s.MaxItems, "max-items", 0, "Most records the Stream holds before the oldest are reclaimed. Default is zero (unbounded).")
+	s.Command.Flags().IntVar(&s.MaxBytes, "max-bytes", 0, "Most bytes the Stream holds. An append past it is refused until records are reclaimed. Default is zero (unbounded).")
 	s.StreamIdOptions.BuildFlags(s.Command.Flags())
 	s.Command.Run = func(c *cobra.Command, args []string) {
 		if err := s.run(cctx, args); err != nil {

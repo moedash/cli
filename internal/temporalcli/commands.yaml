@@ -3600,19 +3600,27 @@ commands:
           --stream-id YourStreamId
       ```
 
-      A closed Stream is deleted once `--retention` passes. Without it the
-      Namespace's retention applies.
+      Records older than `--retention` are reclaimed, and a closed Stream is
+      deleted once it passes. Without it the Namespace's retention applies.
+      Creating a Stream that already exists with the same lifecycle is an
+      idempotent retry; a different lifecycle is refused.
     options:
       - name: retention
         type: duration
         description: |
-          How long a closed Stream stays readable.
+          How long a record stays readable, and how long a closed Stream
+          stays readable before it is deleted.
           Cannot be longer than the Namespace's retention.
       - name: max-items
         type: int
         description: |
           Most records the Stream holds before the oldest are reclaimed.
           Default is zero (unbounded).
+      - name: max-bytes
+        type: int
+        description: |
+          Most bytes the Stream holds. An append past it is refused until
+          records are reclaimed. Default is zero (unbounded).
     option-sets:
       - stream-id
 
