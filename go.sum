@@ -334,10 +334,10 @@ github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJ
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee h1:W5t00kpgFdJifH4BDsTlE89Zl93FEloxaWZfGcifgq8=
 github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
-github.com/moedash/api-go v1.63.6-0.20260928231238-13b1d5c10c87 h1:gJUb/+grsLjmIW8ez6IS6D4c8PSGkiMV1K1tRxOTdnE=
-github.com/moedash/api-go v1.63.6-0.20260928231238-13b1d5c10c87/go.mod h1:acM0I9WPuYg8W3Pd9jOZvEgi7mRUttUQ4+e7fowKVnM=
-github.com/moedash/temporal v0.0.0-20261001011614-0da41f7f10ac h1:WOzaAQQgxJh2KoTY50IPaMIfFoueW9eQ3ZEQx8X2BEU=
-github.com/moedash/temporal v0.0.0-20261001011614-0da41f7f10ac/go.mod h1:Cv8Lgk8UYbdl51BFKdq8qcnueDYtScehOkK2hRc/nt0=
+github.com/moedash/api-go v1.63.6-0.20261001181030-7f12d09c2bef h1:ilLSV24dMIxjmAN6noyeml9ezcMSW+sIZwIeeV377Vg=
+github.com/moedash/api-go v1.63.6-0.20261001181030-7f12d09c2bef/go.mod h1:acM0I9WPuYg8W3Pd9jOZvEgi7mRUttUQ4+e7fowKVnM=
+github.com/moedash/temporal v0.0.0-20261001185713-ffbe615121a7 h1:wLAa9QCjUQAIpUTI9FnTzFOMA9F94TxSpGnbfku7FcI=
+github.com/moedash/temporal v0.0.0-20261001185713-ffbe615121a7/go.mod h1:7hL8QbSBczWKOKjmMJHrHQ7qGKxCI1l7yecU8J3wUqk=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
