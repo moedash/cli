@@ -820,6 +820,53 @@ func lineContaining(t *testing.T, text, piece string) string {
 	return ""
 }
 
+func (s *SharedServerSuite) TestChannel_WorkflowDescribeListsLinked() {
+	s.Worker().OnDevWorkflow(func(ctx workflow.Context, a any) (any, error) {
+		workflow.GetSignalChannel(ctx, "finish").Receive(ctx, nil)
+		return nil, nil
+	})
+	run, err := s.Client.ExecuteWorkflow(
+		s.Context,
+		client.StartWorkflowOptions{TaskQueue: s.Worker().Options.TaskQueue},
+		DevWorkflow,
+		"ignored",
+	)
+	s.NoError(err)
+	describe := func(args ...string) *CommandResult {
+		return s.Execute(append([]string{"workflow", "describe", "--address", s.Address(),
+			"-w", run.GetID()}, args...)...)
+	}
+
+	// A fresh workflow stands on no channel, so the section is absent.
+	res := describe()
+	s.NoError(res.Err)
+	s.NotContains(res.Stdout.String(), "Notification Channels")
+
+	ch := "channel-" + uuid.NewString()
+	res = s.Execute("channel", "notify", "--address", s.Address(), "-c", ch,
+		"--workflow-id", run.GetID(), "--position", "p1", "--counter", "1")
+	s.NoError(res.Err)
+
+	res = describe()
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Notification Channels: 1")
+	s.ContainsOnSameLine(res.Stdout.String(), ch, "Linked")
+
+	res = describe("-o", "json")
+	s.NoError(res.Err)
+	var described workflowservice.DescribeWorkflowExecutionResponse
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &described, true))
+	s.Len(described.GetChannelSubscriptions(), 1)
+	linked := described.GetChannelSubscriptions()[0]
+	s.Equal(ch, linked.GetChannel())
+	s.Equal(notificationpb.CHANNEL_KIND_LINKED, linked.GetKind())
+	s.Equal(int32(1), linked.GetRetainedCount())
+	s.Equal(int64(1), linked.GetAcceptedCount())
+
+	s.NoError(s.Client.SignalWorkflow(s.Context, run.GetID(), "", "finish", nil))
+	s.NoError(run.Get(s.Context, nil))
+}
+
 func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {
 	s.Worker().OnDevWorkflow(func(ctx workflow.Context, a any) (any, error) {
 		workflow.GetSignalChannel(ctx, "finish").Receive(ctx, nil)

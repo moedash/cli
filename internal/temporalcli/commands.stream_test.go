@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/temporalio/cli/internal/temporalcli"
+	notificationpb "go.temporal.io/api/notification/v1"
 	streamapi "go.temporal.io/api/stream/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
@@ -400,6 +402,51 @@ func (s *SharedServerSuite) TestStream_List() {
 	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(entries[0], &entry, true))
 	s.Contains(entry.GetStreamId(), prefix)
 	s.NotEmpty(entry.GetRunId())
+}
+
+func (s *SharedServerSuite) TestStream_StandaloneNotifiesItsChannel() {
+	id := "stream-" + uuid.NewString()
+	s.createStream(id)
+	ch := "stream/" + id
+	poll := func(after int64) *notificationpb.Notification {
+		res := s.Execute("channel", "poll", "--address", s.Address(), "-c", ch,
+			"--after-counter", strconv.FormatInt(after, 10), "--wait", "10s", "-o", "jsonl")
+		s.NoError(res.Err)
+		raw := decodeJSONValues(s.T(), res.Stdout.String())
+		s.NotEmpty(raw)
+		var n notificationpb.Notification
+		s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[len(raw)-1], &n, true))
+		return &n
+	}
+
+	res := s.Execute("stream", "describe", "--address", s.Address(), "--stream-id", id)
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Channel", ch)
+	s.ContainsOnSameLine(res.Stdout.String(), "Kind", "Independent")
+
+	res = s.Execute("stream", "append", "--address", s.Address(), "--stream-id", id,
+		"--input", `{"home": 1}`)
+	s.NoError(res.Err)
+	// A standalone stream's notify reaches its channel through a task of its
+	// own, so the poll waits for it.
+	n := poll(0)
+	s.Equal(ch, n.GetChannel())
+	s.GreaterOrEqual(n.GetCounter(), int64(1))
+	s.Equal(id+":1", string(n.GetPosition()))
+	s.Nil(n.GetMetadata()["closed"])
+
+	res = s.Execute("stream", "close", "--address", s.Address(), "--stream-id", id)
+	s.NoError(res.Err)
+	closed := poll(n.GetCounter())
+	s.Greater(closed.GetCounter(), n.GetCounter())
+	s.Equal(id+":1", string(closed.GetPosition()))
+	s.Equal("true", string(closed.GetMetadata()["closed"].GetData()))
+
+	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch)
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Kind", "Independent")
+	s.ContainsOnSameLine(res.Stdout.String(), "LatestCounter",
+		strconv.FormatInt(closed.GetCounter(), 10))
 }
 
 func (s *SharedServerSuite) TestStream_ReferenceValidation() {
