@@ -233,6 +233,6 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace go.temporal.io/server => github.com/moedash/temporal v0.0.0-20261002104821-503a59464873
+replace go.temporal.io/server => github.com/moedash/temporal v0.0.0-20261002110130-4ab4b47eb4e3
 
 replace go.temporal.io/api => github.com/moedash/api-go v1.63.6-0.20261002094643-d00f9ebbd3af
