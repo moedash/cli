@@ -235,4 +235,4 @@ require (
 
 replace go.temporal.io/server => github.com/moedash/temporal v0.0.0-20261002062742-44a16e6f0d70
 
-replace go.temporal.io/api => github.com/moedash/api-go v1.63.6-0.20261002052723-00345eb591a1
+replace go.temporal.io/api => github.com/moedash/api-go v1.63.6-0.20261002094643-d00f9ebbd3af
