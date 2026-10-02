@@ -20,9 +20,11 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	notificationpb "go.temporal.io/api/notification/v1"
 	"go.temporal.io/api/serviceerror"
+	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
+	streampb "go.temporal.io/server/chasm/lib/stream/gen/streampb/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -47,6 +49,19 @@ type fakeChannelService struct {
 	pollAnswers [][]*notificationpb.Notification
 	// onPoll runs with the number of polls seen so far.
 	onPoll func(n int)
+	// describeWorkflow answers the workflow description with its channels.
+	describeWorkflow *workflowservice.DescribeWorkflowExecutionResponse
+}
+
+func (f *fakeChannelService) DescribeWorkflowExecution(
+	context.Context, *workflowservice.DescribeWorkflowExecutionRequest,
+) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.describeWorkflow, nil
 }
 
 func (f *fakeChannelService) GetSystemInfo(
@@ -130,6 +145,14 @@ func (f *fakeChannelService) PollChannel(
 }
 
 func startFakeChannelService(t *testing.T, f *fakeChannelService) string {
+	return startFakeServices(t, f, nil)
+}
+
+// startFakeServices serves a fake workflow service and, when given, a fake
+// stream service on one address, the way the Service's frontend does.
+func startFakeServices(
+	t *testing.T, wf workflowservice.WorkflowServiceServer, st streampb.StreamServiceServer,
+) string {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	// The Service sends its errors as gRPC statuses; a bare server would send
@@ -143,7 +166,10 @@ func startFakeChannelService(t *testing.T, f *fakeChannelService) string {
 		}
 		return resp, nil
 	}))
-	workflowservice.RegisterWorkflowServiceServer(srv, f)
+	workflowservice.RegisterWorkflowServiceServer(srv, wf)
+	if st != nil {
+		streampb.RegisterStreamServiceServer(srv, st)
+	}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(srv.Stop)
 	return ln.Addr().String()
@@ -713,6 +739,85 @@ func TestChannel_LinkedNotFound(t *testing.T) {
 	require.Error(t, res.Err)
 	assert.Contains(t, res.Err.Error(), `workflow "gone" has no running execution`)
 	assert.Contains(t, res.Err.Error(), `channel "ch" of workflow "gone"`)
+}
+
+// runningWorkflowDescription is a description with what the text output
+// dereferences, for a run that is still open so no close event is fetched.
+func runningWorkflowDescription(
+	subs ...*workflowpb.ChannelSubscriptionInfo,
+) *workflowservice.DescribeWorkflowExecutionResponse {
+	return &workflowservice.DescribeWorkflowExecutionResponse{
+		WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: "wf-1", RunId: "run-1"},
+			Type:      &commonpb.WorkflowType{Name: "DevWorkflow"},
+			Status:    enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			StartTime: timestamppb.New(time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)),
+		},
+		ChannelSubscriptions: subs,
+	}
+}
+
+func TestChannel_WorkflowDescribeListsChannels(t *testing.T) {
+	f := &fakeChannelService{describeWorkflow: runningWorkflowDescription(
+		&workflowpb.ChannelSubscriptionInfo{
+			Channel:             "demo",
+			Kind:                notificationpb.CHANNEL_KIND_INDEPENDENT,
+			SubscribedEventId:   5,
+			LastCounter:         4,
+			PendingNotification: &notificationpb.Notification{Channel: "demo", Counter: 5},
+		},
+		&workflowpb.ChannelSubscriptionInfo{
+			Channel:          "stream/scores",
+			Kind:             notificationpb.CHANNEL_KIND_LINKED,
+			LastCounter:      3,
+			ScheduledCounter: 0,
+			ListenerCount:    2,
+			RetainedCount:    16,
+			AcceptedCount:    3,
+		},
+	)}
+	addr := startFakeChannelService(t, f)
+	h := NewCommandHarness(t)
+
+	res := h.Execute("workflow", "describe", "--address", addr, "-w", "wf-1")
+	require.NoError(t, res.Err)
+	out := res.Stdout.String()
+	h.ContainsOnSameLine(out, "Notification Channels: 2")
+	h.ContainsOnSameLine(out, "Channel", "Kind", "LastCounter", "PendingCounter",
+		"ScheduledCounter", "Listeners", "Retained")
+	// The pending column is blank, not zero, when nothing is pending.
+	assert.Equal(t, []string{"demo", "Independent", "4", "5", "0", "0", "0"},
+		strings.Fields(lineContaining(t, out, "demo")))
+	assert.Equal(t, []string{"stream/scores", "Linked", "3", "0", "2", "16"},
+		strings.Fields(lineContaining(t, out, "stream/scores")))
+
+	res = h.Execute("workflow", "describe", "--address", addr, "-w", "wf-1", "-o", "json")
+	require.NoError(t, res.Err)
+	var described workflowservice.DescribeWorkflowExecutionResponse
+	require.NoError(t, temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &described, true))
+	require.Len(t, described.GetChannelSubscriptions(), 2)
+	assert.Equal(t, int64(5), described.GetChannelSubscriptions()[0].GetSubscribedEventId())
+	assert.Equal(t, int64(5),
+		described.GetChannelSubscriptions()[0].GetPendingNotification().GetCounter())
+	linked := described.GetChannelSubscriptions()[1]
+	assert.Equal(t, notificationpb.CHANNEL_KIND_LINKED, linked.GetKind())
+	assert.Equal(t, int64(3), linked.GetAcceptedCount())
+
+	// A workflow standing on no channel has no section at all.
+	f.describeWorkflow = runningWorkflowDescription()
+	res = h.Execute("workflow", "describe", "--address", addr, "-w", "wf-1")
+	require.NoError(t, res.Err)
+	assert.NotContains(t, res.Stdout.String(), "Notification Channels")
+}
+
+func lineContaining(t *testing.T, text, piece string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, piece) {
+			return line
+		}
+	}
+	require.Failf(t, "line not found", "no line contains %q", piece)
+	return ""
 }
 
 func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -20,6 +21,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	notificationpb "go.temporal.io/api/notification/v1"
 	"go.temporal.io/api/serviceerror"
+	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -178,6 +180,43 @@ func channelKindText(kind notificationpb.ChannelKind) string {
 		kind = notificationpb.CHANNEL_KIND_INDEPENDENT
 	}
 	return kind.String()
+}
+
+// printChannelSubscriptions lists the channels a workflow stands on, as its
+// description reports them. A workflow that stands on none prints nothing, so
+// the section is absent on servers that predate it as well.
+func printChannelSubscriptions(
+	cctx *CommandContext, subs []*workflowpb.ChannelSubscriptionInfo,
+) error {
+	if len(subs) == 0 {
+		return nil
+	}
+	rows := make([]struct {
+		Channel          string
+		Kind             string
+		LastCounter      int64
+		PendingCounter   string
+		ScheduledCounter int64
+		Listeners        int32
+		Retained         int32
+	}, len(subs))
+	for i, s := range subs {
+		rows[i].Channel = s.GetChannel()
+		rows[i].Kind = channelKindText(s.GetKind())
+		rows[i].LastCounter = s.GetLastCounter()
+		if pending := s.GetPendingNotification(); pending != nil {
+			rows[i].PendingCounter = strconv.FormatInt(pending.GetCounter(), 10)
+		}
+		rows[i].ScheduledCounter = s.GetScheduledCounter()
+		rows[i].Listeners = s.GetListenerCount()
+		rows[i].Retained = s.GetRetainedCount()
+	}
+	cctx.Printer.Println()
+	cctx.Printer.Println(color.MagentaString("Notification Channels: %v", len(subs)))
+	cctx.Printer.Println()
+	return cctx.Printer.PrintStructured(rows, printer.StructuredOptions{
+		Table: &printer.TableOptions{},
+	})
 }
 
 func (c *TemporalChannelNotifyCommand) run(cctx *CommandContext, _ []string) error {
