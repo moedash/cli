@@ -1,18 +1,109 @@
 package temporalcli_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/temporalio/cli/internal/temporalcli"
 	streamapi "go.temporal.io/api/stream/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
 	streampb "go.temporal.io/server/chasm/lib/stream/gen/streampb/v1"
 )
+
+// fakeStreamService answers every describe with one canned state and records
+// the owners the CLI named, so the output is checked without a server that
+// carries streams.
+type fakeStreamService struct {
+	streampb.UnimplementedStreamServiceServer
+
+	mu    sync.Mutex
+	state *streampb.StreamState
+	owned []*streampb.DescribeWorkflowStreamInput
+}
+
+func (f *fakeStreamService) DescribeStream(
+	context.Context, *streampb.DescribeStreamRequest,
+) (*streampb.DescribeStreamResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &streampb.DescribeStreamResponse{
+		FrontendResponse: &streampb.DescribeStreamOutput{State: f.state},
+	}, nil
+}
+
+func (f *fakeStreamService) DescribeWorkflowStream(
+	_ context.Context, req *streampb.DescribeWorkflowStreamRequest,
+) (*streampb.DescribeWorkflowStreamResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.owned = append(f.owned, req.GetFrontendRequest())
+	return &streampb.DescribeWorkflowStreamResponse{
+		FrontendResponse: &streampb.DescribeStreamOutput{State: f.state},
+	}, nil
+}
+
+func TestStream_DescribeChannel(t *testing.T) {
+	st := &fakeStreamService{state: &streampb.StreamState{HeadOffset: 2}}
+	addr := startFakeServices(t, &fakeChannelService{}, st)
+	h := NewCommandHarness(t)
+	// channelSection is the output from the channel card on, so the owner
+	// asserted on is the channel's and not the stream card's.
+	channelSection := func(args ...string) string {
+		res := h.Execute(append([]string{"stream", "describe", "--address", addr}, args...)...)
+		require.NoError(t, res.Err)
+		out := res.Stdout.String()
+		h.ContainsOnSameLine(out, "HeadOffset", "2")
+		_, section, found := strings.Cut(out, "Notification Channel:")
+		require.True(t, found, "no channel card in %q", out)
+		return section
+	}
+
+	section := channelSection("--stream-id", "scores")
+	h.ContainsOnSameLine(section, "Channel", "stream/scores")
+	h.ContainsOnSameLine(section, "Kind", "Independent")
+	assert.NotContains(t, section, "WorkflowId")
+
+	// The owner's default stream has the name the server resolves it to.
+	section = channelSection("--workflow-id", "wf-1")
+	h.ContainsOnSameLine(section, "Channel", "stream/output")
+	h.ContainsOnSameLine(section, "Kind", "Linked")
+	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
+	assert.NotContains(t, section, "RunId")
+
+	section = channelSection("--workflow-id", "wf-1", "--run-id", "run-1", "--name", "scores")
+	h.ContainsOnSameLine(section, "Channel", "stream/scores")
+	h.ContainsOnSameLine(section, "Kind", "Linked")
+	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
+	h.ContainsOnSameLine(section, "RunId", "run-1")
+
+	section = channelSection("--workflow-id", "wf-1", "--activity-id", "act-1", "--name", "scores")
+	h.ContainsOnSameLine(section, "Channel", "stream/act-1/scores")
+	h.ContainsOnSameLine(section, "Kind", "Linked")
+	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
+
+	// A standalone activity has no linked channels, so its stream notifies an
+	// independent one of the same shape.
+	section = channelSection("--activity-id", "act-1", "--name", "scores")
+	h.ContainsOnSameLine(section, "Channel", "stream/act-1/scores")
+	h.ContainsOnSameLine(section, "Kind", "Independent")
+	assert.NotContains(t, section, "WorkflowId")
+
+	// The derivation adds no call: each describe reached the service once.
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	require.Len(t, st.owned, 4)
+	assert.Equal(t, "", st.owned[0].GetStreamName(), "the server resolves the default name")
+	assert.Equal(t, streampb.STREAM_OWNER_KIND_ACTIVITY, st.owned[3].GetOwner().GetKind())
+}
 
 func (s *SharedServerSuite) createStream(id string, args ...string) {
 	res := s.Execute(append([]string{

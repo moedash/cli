@@ -51,7 +51,12 @@ stream's lifecycle is its owner's.
 
 `stream describe <ref>`
 : Frontier, floor, readable record count, held and appended bytes, close
-  state and reason, retention, caps, budget, producers and consumers.
+  state and reason, retention, caps, budget, producers and consumers. Also
+  the notification channel the stream notifies on each append and close,
+  derived from the reference alone: `stream/NAME` linked to the owner for a
+  workflow's stream, `stream/ACTIVITY_ID/NAME` for an activity's, and the
+  independent `stream/STREAM_ID` for a standalone stream. `temporal channel
+  poll --channel C [--workflow-id OWNER]` follows it.
 
 `stream read <ref> [--from-offset N | --from-tail | --last N] [--follow]
 [--topic T]... [--limit N]`

@@ -16,6 +16,7 @@ import (
 	"github.com/temporalio/cli/cliext"
 	"github.com/temporalio/cli/internal/printer"
 	commonpb "go.temporal.io/api/common/v1"
+	notificationpb "go.temporal.io/api/notification/v1"
 	"go.temporal.io/api/serviceerror"
 	streamapi "go.temporal.io/api/stream/v1"
 	"go.temporal.io/api/temporalproto"
@@ -85,14 +86,20 @@ type streamTarget struct {
 	name     string
 }
 
+// resolvedName is the name the server resolves an owned stream to when the
+// command leaves it out.
+func (t streamTarget) resolvedName() string {
+	if t.name == "" {
+		return streamlib.DefaultStreamName
+	}
+	return t.name
+}
+
 func (t streamTarget) String() string {
 	if t.streamID != "" {
 		return fmt.Sprintf("stream %q", t.streamID)
 	}
-	name := t.name
-	if name == "" {
-		name = "default"
-	}
+	name := t.resolvedName()
 	switch t.owner.GetKind() {
 	case streampb.STREAM_OWNER_KIND_WORKFLOW_ACTIVITY:
 		return fmt.Sprintf("stream %q of activity %q in workflow %q",
@@ -101,6 +108,50 @@ func (t streamTarget) String() string {
 		return fmt.Sprintf("stream %q of activity %q", name, t.owner.GetId())
 	default:
 		return fmt.Sprintf("stream %q of workflow %q", name, t.owner.GetId())
+	}
+}
+
+// streamChannelPrefix starts the name of every notification channel a stream
+// notifies.
+const streamChannelPrefix = "stream/"
+
+// streamChannel is the notification channel a stream notifies on each append
+// and on its close. The server derives the name from the stream's identity
+// alone, so the CLI derives the same name without a call and a listener can
+// follow a stream before it exists.
+type streamChannel struct {
+	name  string
+	kind  notificationpb.ChannelKind
+	owner *commonpb.WorkflowExecution
+}
+
+func (t streamTarget) channel() streamChannel {
+	if t.streamID != "" {
+		return streamChannel{
+			name: streamChannelPrefix + t.streamID,
+			kind: notificationpb.CHANNEL_KIND_INDEPENDENT,
+		}
+	}
+	owner := &commonpb.WorkflowExecution{WorkflowId: t.owner.GetId(), RunId: t.owner.GetRunId()}
+	switch t.owner.GetKind() {
+	case streampb.STREAM_OWNER_KIND_WORKFLOW_ACTIVITY:
+		return streamChannel{
+			name:  streamChannelPrefix + t.owner.GetActivityId() + "/" + t.resolvedName(),
+			kind:  notificationpb.CHANNEL_KIND_LINKED,
+			owner: owner,
+		}
+	case streampb.STREAM_OWNER_KIND_ACTIVITY:
+		// A standalone activity has no linked channels of its own.
+		return streamChannel{
+			name: streamChannelPrefix + t.owner.GetId() + "/" + t.resolvedName(),
+			kind: notificationpb.CHANNEL_KIND_INDEPENDENT,
+		}
+	default:
+		return streamChannel{
+			name:  streamChannelPrefix + t.resolvedName(),
+			kind:  notificationpb.CHANNEL_KIND_LINKED,
+			owner: owner,
+		}
 	}
 }
 
@@ -469,6 +520,23 @@ func (c *TemporalStreamDescribeCommand) run(cctx *CommandContext, _ []string) er
 	}
 	cctx.Printer.Println(color.MagentaString("Stream:"))
 	if err := cctx.Printer.PrintStructured(info, printer.StructuredOptions{}); err != nil {
+		return err
+	}
+
+	ch := target.channel()
+	cctx.Printer.Println()
+	cctx.Printer.Println(color.MagentaString("Notification Channel:"))
+	if err := cctx.Printer.PrintStructured(struct {
+		Channel    string
+		Kind       string
+		WorkflowId string `cli:",cardOmitEmpty"`
+		RunId      string `cli:",cardOmitEmpty"`
+	}{
+		Channel:    ch.name,
+		Kind:       ch.kind.String(),
+		WorkflowId: ch.owner.GetWorkflowId(),
+		RunId:      ch.owner.GetRunId(),
+	}, printer.StructuredOptions{}); err != nil {
 		return err
 	}
 

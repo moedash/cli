@@ -3907,6 +3907,21 @@ commands:
           --workflow-id YourWorkflowId \
           --name scores
       ```
+
+      The output also names the notification channel the Stream notifies on
+      each append and on its close. The name follows from the Stream alone,
+      so no call to the Service is needed. A Stream a Workflow Execution
+      owns notifies `stream/NAME`, linked to the owner. A Stream of an
+      Activity the Workflow scheduled notifies `stream/ACTIVITY_ID/NAME`,
+      linked to the owner too. A standalone Stream notifies the independent
+      channel `stream/STREAM_ID`. Pass the channel, and the owner of a
+      linked one, to `temporal channel poll` to follow the Stream:
+
+      ```
+      temporal channel poll \
+          --channel stream/scores \
+          --workflow-id YourWorkflowId
+      ```
     option-sets:
       - stream-reference
 
