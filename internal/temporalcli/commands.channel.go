@@ -1,0 +1,491 @@
+package temporalcli
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/fatih/color"
+	"github.com/google/uuid"
+	"github.com/temporalio/cli/internal/printer"
+	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
+	notificationpb "go.temporal.io/api/notification/v1"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/sdk/client"
+	"google.golang.org/protobuf/types/known/durationpb"
+)
+
+// channelPollGrace is how long past the requested wait a poll may take before
+// the CLI gives up on it, so a Service answering at its own deadline is not cut
+// off.
+const channelPollGrace = 10 * time.Second
+
+// plainChannelRefusal turns the Service's refusals into what to do next. Every
+// other error comes back as it was.
+func plainChannelRefusal(err error, channel string) error {
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		return &streamRefusal{
+			plain: fmt.Sprintf("there is no channel %q. A channel exists once a writer "+
+				"notifies it or a listener registers on it, and goes away after a while "+
+				"with neither.", channel),
+			detail: notFound.Message,
+			cause:  err,
+		}
+	}
+	var exhausted *serviceerror.ResourceExhausted
+	if !errors.As(err, &exhausted) {
+		return err
+	}
+	var plain string
+	switch exhausted.Cause {
+	case enumspb.RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT:
+		plain = "the channel already has as many listeners as it may hold, so this one " +
+			"was not registered. Remove a listener it no longer needs, or use another channel."
+	case enumspb.RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT:
+		plain = "the namespace is notifying channels faster than it may, so this " +
+			"notification was not sent. Retry after a moment, or notify less often."
+	default:
+		plain = "the Service is over one of its limits and refused the call. Retry after " +
+			"a moment."
+	}
+	return &streamRefusal{plain: plain, detail: exhausted.Message, cause: err}
+}
+
+// parseChannelMetadata reads KEY=VALUE pairs whose values are JSON, carried as
+// JSON payloads the way --input carries a Signal's arguments.
+func parseChannelMetadata(pairs []string) (map[string]*commonpb.Payload, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]*commonpb.Payload, len(pairs))
+	for _, pair := range pairs {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("--metadata %q must be KEY=VALUE", pair)
+		}
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("--metadata key %q is given more than once", key)
+		}
+		if !json.Valid([]byte(value)) {
+			return nil, fmt.Errorf("--metadata value for %q is not valid JSON", key)
+		}
+		out[key] = &commonpb.Payload{
+			Metadata: map[string][]byte{"encoding": []byte("json/plain")},
+			Data:     []byte(value),
+		}
+	}
+	return out, nil
+}
+
+// positionText shows a position as the text it most often is, and as base64
+// when it holds bytes a terminal would mangle.
+func positionText(p []byte) string {
+	if utf8.Valid(p) && strings.IndexFunc(string(p), func(r rune) bool {
+		return !unicode.IsPrint(r)
+	}) < 0 {
+		return string(p)
+	}
+	return "base64:" + base64.StdEncoding.EncodeToString(p)
+}
+
+// metadataText puts a notification's metadata on one line, keys sorted so the
+// same notification always reads the same.
+func metadataText(md map[string]*commonpb.Payload) (string, error) {
+	keys := make([]string, 0, len(md))
+	for k := range md {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v, err := payloadText(md[k])
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, k+"="+v)
+	}
+	return strings.Join(parts, " "), nil
+}
+
+type channelNotificationRow struct {
+	Counter  int64
+	Position string
+	Metadata string
+}
+
+func notificationRow(n *notificationpb.Notification) (channelNotificationRow, error) {
+	md, err := metadataText(n.GetMetadata())
+	if err != nil {
+		return channelNotificationRow{}, err
+	}
+	return channelNotificationRow{
+		Counter:  n.GetCounter(),
+		Position: positionText(n.GetPosition()),
+		Metadata: md,
+	}, nil
+}
+
+func (c *TemporalChannelNotifyCommand) run(cctx *CommandContext, _ []string) error {
+	if c.Counter <= 0 {
+		return fmt.Errorf("--counter must be greater than zero")
+	}
+	metadata, err := parseChannelMetadata(c.Metadata)
+	if err != nil {
+		return err
+	}
+	cl, err := dialClient(cctx, &c.Parent.ClientOptions)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	resp, err := cl.WorkflowService().NotifyChannel(cctx, &workflowservice.NotifyChannelRequest{
+		Namespace: c.Parent.Namespace,
+		Notification: &notificationpb.Notification{
+			Channel:  c.Channel,
+			Position: []byte(c.Position),
+			Counter:  int64(c.Counter),
+			Metadata: metadata,
+		},
+		Identity:  c.Parent.Identity,
+		RequestId: uuid.NewString(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed notifying channel %q: %w",
+			c.Channel, plainChannelRefusal(err, c.Channel))
+	}
+	if cctx.JSONOutput {
+		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
+	}
+	cctx.Printer.Printlnf("Notified channel %v. Listeners reached: %v",
+		c.Channel, resp.GetListenerCount())
+	return nil
+}
+
+func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) error {
+	cl, err := dialClient(cctx, &c.Parent.ClientOptions)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	resp, err := cl.WorkflowService().DescribeChannel(cctx,
+		&workflowservice.DescribeChannelRequest{
+			Namespace: c.Parent.Namespace,
+			Channel:   c.Channel,
+		})
+	if err != nil {
+		return fmt.Errorf("failed describing channel %q: %w",
+			c.Channel, plainChannelRefusal(err, c.Channel))
+	}
+	if cctx.JSONOutput {
+		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
+	}
+
+	info := struct {
+		Channel        string
+		RetainedCount  int32
+		LatestCounter  int64  `cli:",cardOmitEmpty"`
+		LatestPosition string `cli:",cardOmitEmpty"`
+		LatestMetadata string `cli:",cardOmitEmpty"`
+	}{
+		Channel:       c.Channel,
+		RetainedCount: resp.GetRetainedCount(),
+	}
+	if latest := resp.GetLatest(); latest != nil {
+		row, err := notificationRow(latest)
+		if err != nil {
+			return err
+		}
+		info.LatestCounter, info.LatestPosition, info.LatestMetadata =
+			row.Counter, row.Position, row.Metadata
+	}
+	cctx.Printer.Println(color.MagentaString("Channel:"))
+	if err := cctx.Printer.PrintStructured(info, printer.StructuredOptions{}); err != nil {
+		return err
+	}
+
+	type workflowRow struct {
+		ListenerId string
+		WorkflowId string
+		RunId      string
+		Registered time.Time
+	}
+	// Headers stay out of the table because they often carry credentials.
+	type callbackRow struct {
+		ListenerId string
+		Url        string
+		Registered time.Time
+	}
+	var workflows []workflowRow
+	var callbacks []callbackRow
+	for _, l := range resp.GetListeners() {
+		registered := l.GetRegisteredTime().AsTime()
+		if wf := l.GetWorkflow(); wf != nil {
+			workflows = append(workflows, workflowRow{
+				ListenerId: l.GetListenerId(),
+				WorkflowId: wf.GetWorkflowId(),
+				RunId:      wf.GetRunId(),
+				Registered: registered,
+			})
+		} else if cb := l.GetCallback(); cb != nil {
+			callbacks = append(callbacks, callbackRow{
+				ListenerId: l.GetListenerId(),
+				Url:        cb.GetNexus().GetUrl(),
+				Registered: registered,
+			})
+		}
+	}
+	sort.Slice(workflows, func(i, j int) bool {
+		return workflows[i].ListenerId < workflows[j].ListenerId
+	})
+	sort.Slice(callbacks, func(i, j int) bool {
+		return callbacks[i].ListenerId < callbacks[j].ListenerId
+	})
+	cctx.Printer.Println()
+	cctx.Printer.Println(color.MagentaString("Workflow listeners: %v", len(workflows)))
+	if len(workflows) > 0 {
+		if err := cctx.Printer.PrintStructured(workflows, printer.StructuredOptions{
+			Table: &printer.TableOptions{},
+		}); err != nil {
+			return err
+		}
+	}
+	cctx.Printer.Println()
+	cctx.Printer.Println(color.MagentaString("Callback listeners: %v", len(callbacks)))
+	if len(callbacks) > 0 {
+		return cctx.Printer.PrintStructured(callbacks, printer.StructuredOptions{
+			Table: &printer.TableOptions{},
+		})
+	}
+	return nil
+}
+
+func (c *TemporalChannelListenerAddCommand) run(cctx *CommandContext, _ []string) error {
+	if c.CallbackUrl == "" {
+		return fmt.Errorf("--callback-url cannot be empty")
+	}
+	headers, err := stringKeysValues(c.Header)
+	if err != nil {
+		return fmt.Errorf("invalid --header: %w", err)
+	}
+	clientOpts := &c.Parent.Parent.ClientOptions
+	cl, err := dialClient(cctx, clientOpts)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	resp, err := cl.WorkflowService().RegisterChannelListener(cctx,
+		&workflowservice.RegisterChannelListenerRequest{
+			Namespace: clientOpts.Namespace,
+			Channel:   c.Channel,
+			Callback: &commonpb.Callback{
+				Variant: &commonpb.Callback_Nexus_{Nexus: &commonpb.Callback_Nexus{
+					Url:    c.CallbackUrl,
+					Header: headers,
+				}},
+			},
+			RequestId: uuid.NewString(),
+			Identity:  clientOpts.Identity,
+		})
+	if err != nil {
+		return fmt.Errorf("failed adding a listener to channel %q: %w",
+			c.Channel, plainChannelRefusal(err, c.Channel))
+	}
+	if cctx.JSONOutput {
+		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
+	}
+	cctx.Printer.Printlnf("Added listener %v to channel %v", resp.GetListenerId(), c.Channel)
+	return nil
+}
+
+func (c *TemporalChannelListenerRemoveCommand) run(cctx *CommandContext, _ []string) error {
+	clientOpts := &c.Parent.Parent.ClientOptions
+	cl, err := dialClient(cctx, clientOpts)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	_, err = cl.WorkflowService().UnregisterChannelListener(cctx,
+		&workflowservice.UnregisterChannelListenerRequest{
+			Namespace:  clientOpts.Namespace,
+			Channel:    c.Channel,
+			ListenerId: c.ListenerId,
+			Identity:   clientOpts.Identity,
+		})
+	if err != nil {
+		return fmt.Errorf("failed removing listener %q from channel %q: %w",
+			c.ListenerId, c.Channel, plainChannelRefusal(err, c.Channel))
+	}
+	cctx.Printer.Printlnf("Removed listener %v from channel %v", c.ListenerId, c.Channel)
+	return nil
+}
+
+// channelPoller hands out a channel's notifications one at a time. Without
+// follow it makes one poll; with follow it polls again from the highest
+// counter it has seen until the command is interrupted.
+type channelPoller struct {
+	ctx       context.Context
+	cl        client.Client
+	namespace string
+	channel   string
+	after     int64
+	wait      time.Duration
+	max       int32
+	follow    bool
+	buf       []*notificationpb.Notification
+	polled    bool
+}
+
+func (p *channelPoller) next() (*notificationpb.Notification, error) {
+	for len(p.buf) == 0 && (p.follow || !p.polled) {
+		if err := p.poll(); err != nil {
+			// An interrupted command is the poller leaving, not a failure.
+			if p.ctx.Err() != nil {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("failed polling channel %q: %w",
+				p.channel, plainChannelRefusal(err, p.channel))
+		}
+	}
+	if len(p.buf) == 0 {
+		return nil, nil
+	}
+	n := p.buf[0]
+	p.buf = p.buf[1:]
+	return n, nil
+}
+
+func (p *channelPoller) poll() error {
+	ctx, cancel := context.WithTimeout(p.ctx, p.wait+channelPollGrace)
+	defer cancel()
+	resp, err := p.cl.WorkflowService().PollChannel(ctx, &workflowservice.PollChannelRequest{
+		Namespace:        p.namespace,
+		Channel:          p.channel,
+		AfterCounter:     p.after,
+		Wait:             durationpb.New(p.wait),
+		MaxNotifications: p.max,
+	})
+	p.polled = true
+	if err != nil {
+		// A poll the Service held past its deadline is an empty answer, the same
+		// as one it returned with nothing.
+		if ctx.Err() != nil && p.ctx.Err() == nil {
+			return nil
+		}
+		return err
+	}
+	for _, n := range resp.GetNotifications() {
+		p.after = max(p.after, n.GetCounter())
+	}
+	p.buf = append(p.buf, resp.GetNotifications()...)
+	return nil
+}
+
+// channelRowIter adapts the poller to the printer's streaming table.
+type channelRowIter struct{ poller *channelPoller }
+
+func (i *channelRowIter) Next() (any, error) {
+	n, err := i.poller.next()
+	if n == nil || err != nil {
+		return nil, err
+	}
+	return notificationRow(n)
+}
+
+func (c *TemporalChannelPollCommand) run(cctx *CommandContext, _ []string) error {
+	if c.AfterCounter < 0 {
+		return fmt.Errorf("--after-counter cannot be negative")
+	}
+	if c.Max < 0 {
+		return fmt.Errorf("--max cannot be negative")
+	}
+	if c.Wait.Duration() <= 0 {
+		return fmt.Errorf("--wait must be positive")
+	}
+	cl, err := dialClient(cctx, &c.Parent.ClientOptions)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	poller := &channelPoller{
+		ctx:       cctx,
+		cl:        cl,
+		namespace: c.Parent.Namespace,
+		channel:   c.Channel,
+		after:     int64(c.AfterCounter),
+		wait:      c.Wait.Duration(),
+		max:       int32(c.Max),
+		follow:    c.Follow,
+	}
+	if cctx.JSONOutput {
+		// This is a listing command subject to json vs jsonl rules
+		cctx.Printer.StartList()
+		defer cctx.Printer.EndList()
+		for {
+			n, err := poller.next()
+			if err != nil {
+				return err
+			}
+			if n == nil {
+				return nil
+			}
+			if err := cctx.Printer.PrintStructured(n, printer.StructuredOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	if !c.Follow {
+		var rows []channelNotificationRow
+		for {
+			n, err := poller.next()
+			if err != nil {
+				return err
+			}
+			if n == nil {
+				break
+			}
+			row, err := notificationRow(n)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, row)
+		}
+		if len(rows) == 0 {
+			cctx.Printer.Printlnf("No notifications on channel %v after counter %v",
+				c.Channel, c.AfterCounter)
+			return nil
+		}
+		return cctx.Printer.PrintStructured(rows, printer.StructuredOptions{
+			Table: &printer.TableOptions{},
+		})
+	}
+	return cctx.Printer.PrintStructuredTableIter(
+		reflect.TypeOf(channelNotificationRow{}),
+		&channelRowIter{poller: poller},
+		printer.StructuredOptions{
+			Table: &printer.TableOptions{
+				// Streaming rows cannot be measured first, so the columns
+				// before the metadata take fixed widths.
+				FieldWidths: map[string]int{
+					"Counter":  12,
+					"Position": 24,
+				},
+			},
+		},
+	)
+}

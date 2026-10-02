@@ -40,6 +40,7 @@ import (
 	uiserveroptions "github.com/temporalio/ui-server/v2/server/server_options"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/server/chasm/lib/activity"
+	chasmcallback "go.temporal.io/server/chasm/lib/callback"
 	"go.temporal.io/server/chasm/lib/stream"
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/cluster"
@@ -255,6 +256,13 @@ func (s *StartOptions) buildServerOptions() ([]temporal.ServerOption, *slog.Leve
 	// the opt-in: local development is what it exists for, and an explicit
 	// value below still wins.
 	dynConf[stream.EnabledSetting.Key()] = true
+	// The server calls no callback address until one is allowed. A local
+	// receiver is the usual target of a notification channel's callback on
+	// a dev server, and it rarely serves TLS.
+	dynConf[chasmcallback.AllowedAddresses.Key()] = []any{
+		map[string]any{"Pattern": "127.0.0.1:*", "AllowInsecure": true},
+		map[string]any{"Pattern": "localhost:*", "AllowInsecure": true},
+	}
 
 	// Dynamic config if set
 	for k, v := range s.DynamicConfigValues {

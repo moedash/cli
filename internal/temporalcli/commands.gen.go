@@ -97,6 +97,17 @@ func (v *WorkflowReferenceOptions) BuildFlags(f *pflag.FlagSet) {
 	f.StringVarP(&v.RunId, "run-id", "r", "", "Run ID.")
 }
 
+type ChannelOptions struct {
+	Channel string
+	FlagSet *pflag.FlagSet
+}
+
+func (v *ChannelOptions) BuildFlags(f *pflag.FlagSet) {
+	v.FlagSet = f
+	f.StringVarP(&v.Channel, "channel", "c", "", "Name of the notification channel. Required.")
+	_ = cobra.MarkFlagRequired(f, "channel")
+}
+
 type StreamIdOptions struct {
 	StreamId string
 	FlagSet  *pflag.FlagSet
@@ -559,6 +570,7 @@ func NewTemporalCommand(cctx *CommandContext) *TemporalCommand {
 	s.Command.Args = cobra.NoArgs
 	s.Command.AddCommand(&NewTemporalActivityCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalBatchCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalChannelCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalConfigCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalEnvCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalNexusCommand(cctx, &s).Command)
@@ -1213,6 +1225,213 @@ func NewTemporalBatchTerminateCommand(cctx *CommandContext, parent *TemporalBatc
 	_ = cobra.MarkFlagRequired(s.Command.Flags(), "job-id")
 	s.Command.Flags().StringVar(&s.Reason, "reason", "", "Reason for terminating the batch job. Required.")
 	_ = cobra.MarkFlagRequired(s.Command.Flags(), "reason")
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalChannelCommand struct {
+	Parent  *TemporalCommand
+	Command cobra.Command
+	cliext.ClientOptions
+}
+
+func NewTemporalChannelCommand(cctx *CommandContext, parent *TemporalCommand) *TemporalChannelCommand {
+	var s TemporalChannelCommand
+	s.Parent = parent
+	s.Command.Use = "channel"
+	s.Command.Short = "Notify and listen on notification channels"
+	if hasHighlighting {
+		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n\x1b[1mtemporal channel [command] [options]\x1b[0m\n\nFor example:\n\n\x1b[1mtemporal channel poll \\\n    --channel YourChannel \\\n    --follow\x1b[0m\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself."
+	} else {
+		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n```\ntemporal channel [command] [options]\n```\n\nFor example:\n\n```\ntemporal channel poll \\\n    --channel YourChannel \\\n    --follow\n```\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.AddCommand(&NewTemporalChannelDescribeCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalChannelListenerCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalChannelNotifyCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalChannelPollCommand(cctx, &s).Command)
+	s.ClientOptions.BuildFlags(s.Command.PersistentFlags())
+	s.ClientOptions.HideFlags()
+	return &s
+}
+
+type TemporalChannelDescribeCommand struct {
+	Parent  *TemporalChannelCommand
+	Command cobra.Command
+	ChannelOptions
+}
+
+func NewTemporalChannelDescribeCommand(cctx *CommandContext, parent *TemporalChannelCommand) *TemporalChannelDescribeCommand {
+	var s TemporalChannelDescribeCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "describe [flags]"
+	s.Command.Short = "Show a channel's listeners and latest notification"
+	if hasHighlighting {
+		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n\x1b[1mtemporal channel describe \\\n    --channel YourChannel\x1b[0m\n\nA channel exists once a writer notifies it or a listener registers on\nit, and goes away after a while without listeners or activity."
+	} else {
+		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n```\ntemporal channel describe \\\n    --channel YourChannel\n```\n\nA channel exists once a writer notifies it or a listener registers on\nit, and goes away after a while without listeners or activity."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.ChannelOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalChannelListenerCommand struct {
+	Parent  *TemporalChannelCommand
+	Command cobra.Command
+}
+
+func NewTemporalChannelListenerCommand(cctx *CommandContext, parent *TemporalChannelCommand) *TemporalChannelListenerCommand {
+	var s TemporalChannelListenerCommand
+	s.Parent = parent
+	s.Command.Use = "listener"
+	s.Command.Short = "Add or remove a channel's callback listeners"
+	if hasHighlighting {
+		s.Command.Long = "Register a callback the Service calls with every notification on a\nchannel, or remove one:\n\n\x1b[1mtemporal channel listener [command] [options]\x1b[0m\n\nA Workflow listens on a channel from its own code instead, and stops\nlistening when its run ends."
+	} else {
+		s.Command.Long = "Register a callback the Service calls with every notification on a\nchannel, or remove one:\n\n```\ntemporal channel listener [command] [options]\n```\n\nA Workflow listens on a channel from its own code instead, and stops\nlistening when its run ends."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.AddCommand(&NewTemporalChannelListenerAddCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalChannelListenerRemoveCommand(cctx, &s).Command)
+	return &s
+}
+
+type TemporalChannelListenerAddCommand struct {
+	Parent  *TemporalChannelListenerCommand
+	Command cobra.Command
+	ChannelOptions
+	CallbackUrl string
+	Header      []string
+}
+
+func NewTemporalChannelListenerAddCommand(cctx *CommandContext, parent *TemporalChannelListenerCommand) *TemporalChannelListenerAddCommand {
+	var s TemporalChannelListenerAddCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "add [flags]"
+	s.Command.Short = "Register a callback listener"
+	if hasHighlighting {
+		s.Command.Long = "Register a callback on a channel. The Service calls the URL with every\nnotification the channel gets from now on:\n\n\x1b[1mtemporal channel listener add \\\n    --channel YourChannel \\\n    --callback-url https://example.com/notify \\\n    --header \"Authorization=Bearer YourToken\"\x1b[0m\n\nThe command prints the listener ID that \x1b[1mtemporal channel listener\nremove\x1b[0m takes.\n\nThe Service only calls addresses its \x1b[1mcallback.allowedAddresses\x1b[0m\ndynamic configuration value allows. The development server allows\n\x1b[1m127.0.0.1\x1b[0m and \x1b[1mlocalhost\x1b[0m on any port over plain HTTP. Another\nService needs the address added, for example:\n\n\x1b[1m--dynamic-config-value \\\n    'callback.allowedAddresses=[{\"Pattern\":\"*.example.com:443\"}]'\x1b[0m"
+	} else {
+		s.Command.Long = "Register a callback on a channel. The Service calls the URL with every\nnotification the channel gets from now on:\n\n```\ntemporal channel listener add \\\n    --channel YourChannel \\\n    --callback-url https://example.com/notify \\\n    --header \"Authorization=Bearer YourToken\"\n```\n\nThe command prints the listener ID that `temporal channel listener\nremove` takes.\n\nThe Service only calls addresses its `callback.allowedAddresses`\ndynamic configuration value allows. The development server allows\n`127.0.0.1` and `localhost` on any port over plain HTTP. Another\nService needs the address added, for example:\n\n```\n--dynamic-config-value \\\n    'callback.allowedAddresses=[{\"Pattern\":\"*.example.com:443\"}]'\n```"
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVar(&s.CallbackUrl, "callback-url", "", "URL the Service calls with each notification. Required.")
+	_ = cobra.MarkFlagRequired(s.Command.Flags(), "callback-url")
+	s.Command.Flags().StringArrayVar(&s.Header, "header", nil, "Header sent with every call, in `KEY=VALUE` format. Can be passed multiple times.")
+	s.ChannelOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalChannelListenerRemoveCommand struct {
+	Parent  *TemporalChannelListenerCommand
+	Command cobra.Command
+	ChannelOptions
+	ListenerId string
+}
+
+func NewTemporalChannelListenerRemoveCommand(cctx *CommandContext, parent *TemporalChannelListenerCommand) *TemporalChannelListenerRemoveCommand {
+	var s TemporalChannelListenerRemoveCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "remove [flags]"
+	s.Command.Short = "Remove a callback listener"
+	if hasHighlighting {
+		s.Command.Long = "Stop calling a callback listener:\n\n\x1b[1mtemporal channel listener remove \\\n    --channel YourChannel \\\n    --listener-id YourListenerId\x1b[0m\n\nFind the listener ID with \x1b[1mtemporal channel describe\x1b[0m."
+	} else {
+		s.Command.Long = "Stop calling a callback listener:\n\n```\ntemporal channel listener remove \\\n    --channel YourChannel \\\n    --listener-id YourListenerId\n```\n\nFind the listener ID with `temporal channel describe`."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVar(&s.ListenerId, "listener-id", "", "ID of the listener to remove. Required.")
+	_ = cobra.MarkFlagRequired(s.Command.Flags(), "listener-id")
+	s.ChannelOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalChannelNotifyCommand struct {
+	Parent  *TemporalChannelCommand
+	Command cobra.Command
+	ChannelOptions
+	Position string
+	Counter  int
+	Metadata []string
+}
+
+func NewTemporalChannelNotifyCommand(cctx *CommandContext, parent *TemporalChannelCommand) *TemporalChannelNotifyCommand {
+	var s TemporalChannelNotifyCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "notify [flags]"
+	s.Command.Short = "Notify a channel's listeners"
+	if hasHighlighting {
+		s.Command.Long = "Tell every listener of a channel that its source moved. The command\nprints how many listeners the notification reached:\n\n\x1b[1mtemporal channel notify \\\n    --channel YourChannel \\\n    --position 42 \\\n    --counter 42 \\\n    --metadata 'topic=\"scores\"'\x1b[0m\n\nThe position is where the source stands now, in the writer's own\nterms. The counter orders notifications on the channel: when several\nwait for a listener at once, it gets the one with the highest counter.\nMetadata values are JSON."
+	} else {
+		s.Command.Long = "Tell every listener of a channel that its source moved. The command\nprints how many listeners the notification reached:\n\n```\ntemporal channel notify \\\n    --channel YourChannel \\\n    --position 42 \\\n    --counter 42 \\\n    --metadata 'topic=\"scores\"'\n```\n\nThe position is where the source stands now, in the writer's own\nterms. The counter orders notifications on the channel: when several\nwait for a listener at once, it gets the one with the highest counter.\nMetadata values are JSON."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVar(&s.Position, "position", "", "Where the source stands after the write. Sent as text; the Service does not read it. Required.")
+	_ = cobra.MarkFlagRequired(s.Command.Flags(), "position")
+	s.Command.Flags().IntVar(&s.Counter, "counter", 0, "Order of this notification among the channel's notifications. Must be greater than zero. Required.")
+	_ = cobra.MarkFlagRequired(s.Command.Flags(), "counter")
+	s.Command.Flags().StringArrayVar(&s.Metadata, "metadata", nil, "Detail for listeners, in `KEY=VALUE` format. Values must be JSON. Can be passed multiple times.")
+	s.ChannelOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalChannelPollCommand struct {
+	Parent  *TemporalChannelCommand
+	Command cobra.Command
+	ChannelOptions
+	AfterCounter int
+	Wait         cliext.FlagDuration
+	Max          int
+	Follow       bool
+}
+
+func NewTemporalChannelPollCommand(cctx *CommandContext, parent *TemporalChannelCommand) *TemporalChannelPollCommand {
+	var s TemporalChannelPollCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "poll [flags]"
+	s.Command.Short = "Wait for a channel's notifications"
+	if hasHighlighting {
+		s.Command.Long = "Show the notifications a channel keeps, waiting for one when there is\nnone yet:\n\n\x1b[1mtemporal channel poll \\\n    --channel YourChannel\x1b[0m\n\nKeep polling and print notifications as they arrive:\n\n\x1b[1mtemporal channel poll \\\n    --channel YourChannel \\\n    --after-counter 10 \\\n    --follow\x1b[0m\n\nEach notification prints with its counter, position and metadata. With\n\x1b[1m--output json\x1b[0m each notification is one JSON object."
+	} else {
+		s.Command.Long = "Show the notifications a channel keeps, waiting for one when there is\nnone yet:\n\n```\ntemporal channel poll \\\n    --channel YourChannel\n```\n\nKeep polling and print notifications as they arrive:\n\n```\ntemporal channel poll \\\n    --channel YourChannel \\\n    --after-counter 10 \\\n    --follow\n```\n\nEach notification prints with its counter, position and metadata. With\n`--output json` each notification is one JSON object."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().IntVar(&s.AfterCounter, "after-counter", 0, "Show only notifications with a counter above this one.")
+	s.Wait = cliext.MustParseFlagDuration("30s")
+	s.Command.Flags().Var(&s.Wait, "wait", "How long one poll waits for a notification when there is none. The Service may answer sooner.")
+	s.Command.Flags().IntVar(&s.Max, "max", 0, "Most notifications one poll returns. Default is zero (the Service's limit).")
+	s.Command.Flags().BoolVarP(&s.Follow, "follow", "f", false, "Keep polling from the last counter seen until interrupted.")
+	s.ChannelOptions.BuildFlags(s.Command.Flags())
 	s.Command.Run = func(c *cobra.Command, args []string) {
 		if err := s.run(cctx, args); err != nil {
 			cctx.Options.Fail(err)
@@ -2878,9 +3097,9 @@ func NewTemporalServerStartDevCommand(cctx *CommandContext, parent *TemporalServ
 	s.Command.Use = "start-dev [flags]"
 	s.Command.Short = "Start Temporal development server"
 	if hasHighlighting {
-		s.Command.Long = "Run a development Temporal Server on your local system.\n\n\x1b[1m+------------------------------------------------------------------------+\n| WARNING: The development server is not intended for production use.    |\n| It skips certain HTTP security checks to make local use simpler.       |\n|                                                                        |\n| For production use, see:                                               |\n| https://docs.temporal.io/production-deployment                         |\n+------------------------------------------------------------------------+\x1b[0m\n\nView the Web UI for the default configuration at: http://localhost:8233\n\n\x1b[1mtemporal server start-dev\x1b[0m\n\nAdd persistence for Workflow Executions across runs:\n\n\x1b[1mtemporal server start-dev \\\n    --db-filename path-to-your-local-persistent-store\x1b[0m\n\nSet the port from the front-end gRPC Service (7233 default):\n\n\x1b[1mtemporal server start-dev \\\n    --port 7000\x1b[0m\n\nUse a custom port for the Web UI. The default is the gRPC port (7233 default)\nplus 1000 (8233):\n\n\x1b[1mtemporal server start-dev \\\n    --ui-port 3000\x1b[0m\n\nStreams are enabled on the development server. Turn them off with a\ndynamic configuration value:\n\n\x1b[1mtemporal server start-dev \\\n    --dynamic-config-value 'stream.enabled=false'\x1b[0m"
+		s.Command.Long = "Run a development Temporal Server on your local system.\n\n\x1b[1m+------------------------------------------------------------------------+\n| WARNING: The development server is not intended for production use.    |\n| It skips certain HTTP security checks to make local use simpler.       |\n|                                                                        |\n| For production use, see:                                               |\n| https://docs.temporal.io/production-deployment                         |\n+------------------------------------------------------------------------+\x1b[0m\n\nView the Web UI for the default configuration at: http://localhost:8233\n\n\x1b[1mtemporal server start-dev\x1b[0m\n\nAdd persistence for Workflow Executions across runs:\n\n\x1b[1mtemporal server start-dev \\\n    --db-filename path-to-your-local-persistent-store\x1b[0m\n\nSet the port from the front-end gRPC Service (7233 default):\n\n\x1b[1mtemporal server start-dev \\\n    --port 7000\x1b[0m\n\nUse a custom port for the Web UI. The default is the gRPC port (7233 default)\nplus 1000 (8233):\n\n\x1b[1mtemporal server start-dev \\\n    --ui-port 3000\x1b[0m\n\nStreams are enabled on the development server. Turn them off with a\ndynamic configuration value:\n\n\x1b[1mtemporal server start-dev \\\n    --dynamic-config-value 'stream.enabled=false'\x1b[0m\n\nCallbacks to \x1b[1m127.0.0.1\x1b[0m and \x1b[1mlocalhost\x1b[0m on any port are allowed over\nplain HTTP, so a local receiver can listen on a notification channel.\nReplace the list with a dynamic configuration value:\n\n\x1b[1mtemporal server start-dev \\\n    --dynamic-config-value 'callback.allowedAddresses=[]'\x1b[0m"
 	} else {
-		s.Command.Long = "Run a development Temporal Server on your local system.\n\n```\n+------------------------------------------------------------------------+\n| WARNING: The development server is not intended for production use.    |\n| It skips certain HTTP security checks to make local use simpler.       |\n|                                                                        |\n| For production use, see:                                               |\n| https://docs.temporal.io/production-deployment                         |\n+------------------------------------------------------------------------+\n```\n\nView the Web UI for the default configuration at: http://localhost:8233\n\n```\ntemporal server start-dev\n```\n\nAdd persistence for Workflow Executions across runs:\n\n```\ntemporal server start-dev \\\n    --db-filename path-to-your-local-persistent-store\n```\n\nSet the port from the front-end gRPC Service (7233 default):\n\n```\ntemporal server start-dev \\\n    --port 7000\n```\n\nUse a custom port for the Web UI. The default is the gRPC port (7233 default)\nplus 1000 (8233):\n\n```\ntemporal server start-dev \\\n    --ui-port 3000\n```\n\nStreams are enabled on the development server. Turn them off with a\ndynamic configuration value:\n\n```\ntemporal server start-dev \\\n    --dynamic-config-value 'stream.enabled=false'\n```"
+		s.Command.Long = "Run a development Temporal Server on your local system.\n\n```\n+------------------------------------------------------------------------+\n| WARNING: The development server is not intended for production use.    |\n| It skips certain HTTP security checks to make local use simpler.       |\n|                                                                        |\n| For production use, see:                                               |\n| https://docs.temporal.io/production-deployment                         |\n+------------------------------------------------------------------------+\n```\n\nView the Web UI for the default configuration at: http://localhost:8233\n\n```\ntemporal server start-dev\n```\n\nAdd persistence for Workflow Executions across runs:\n\n```\ntemporal server start-dev \\\n    --db-filename path-to-your-local-persistent-store\n```\n\nSet the port from the front-end gRPC Service (7233 default):\n\n```\ntemporal server start-dev \\\n    --port 7000\n```\n\nUse a custom port for the Web UI. The default is the gRPC port (7233 default)\nplus 1000 (8233):\n\n```\ntemporal server start-dev \\\n    --ui-port 3000\n```\n\nStreams are enabled on the development server. Turn them off with a\ndynamic configuration value:\n\n```\ntemporal server start-dev \\\n    --dynamic-config-value 'stream.enabled=false'\n```\n\nCallbacks to `127.0.0.1` and `localhost` on any port are allowed over\nplain HTTP, so a local receiver can listen on a notification channel.\nReplace the list with a dynamic configuration value:\n\n```\ntemporal server start-dev \\\n    --dynamic-config-value 'callback.allowedAddresses=[]'\n```"
 	}
 	s.Command.Args = cobra.NoArgs
 	s.Command.Flags().StringVarP(&s.DbFilename, "db-filename", "f", "", "Path to file for persistent Temporal state store. By default, Workflow Executions are lost when the server process dies.")
