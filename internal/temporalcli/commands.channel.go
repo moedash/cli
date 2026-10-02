@@ -30,18 +30,53 @@ import (
 // off.
 const channelPollGrace = 10 * time.Second
 
+// channelTarget is the channel a command names: an independent channel by its
+// name alone, or a channel linked to a workflow by the workflow and the name.
+type channelTarget struct {
+	name      string
+	execution *commonpb.WorkflowExecution
+}
+
+func (o *ChannelOptions) target() (channelTarget, error) {
+	if o.RunId != "" && o.WorkflowId == "" {
+		return channelTarget{}, fmt.Errorf("--run-id requires --workflow-id")
+	}
+	t := channelTarget{name: o.Channel}
+	if o.WorkflowId != "" {
+		t.execution = &commonpb.WorkflowExecution{WorkflowId: o.WorkflowId, RunId: o.RunId}
+	}
+	return t, nil
+}
+
+func (t channelTarget) String() string {
+	if t.execution == nil {
+		return fmt.Sprintf("channel %q", t.name)
+	}
+	return fmt.Sprintf("channel %q of workflow %q", t.name, t.execution.GetWorkflowId())
+}
+
+// label is the target for a line of normal output, where quotes would be noise.
+func (t channelTarget) label() string {
+	if t.execution == nil {
+		return "channel " + t.name
+	}
+	return "channel " + t.name + " of workflow " + t.execution.GetWorkflowId()
+}
+
 // plainChannelRefusal turns the Service's refusals into what to do next. Every
 // other error comes back as it was.
-func plainChannelRefusal(err error, channel string) error {
+func plainChannelRefusal(err error, t channelTarget) error {
 	var notFound *serviceerror.NotFound
 	if errors.As(err, &notFound) {
-		return &streamRefusal{
-			plain: fmt.Sprintf("there is no channel %q. A channel exists once a writer "+
-				"notifies it or a listener registers on it, and goes away after a while "+
-				"with neither.", channel),
-			detail: notFound.Message,
-			cause:  err,
+		plain := fmt.Sprintf("there is no channel %q. A channel exists once a writer "+
+			"notifies it or a listener registers on it, and goes away after a while "+
+			"with neither.", t.name)
+		if t.execution != nil {
+			plain = fmt.Sprintf("workflow %q has no running execution to reach. A linked "+
+				"channel lives only while its Workflow Execution runs.",
+				t.execution.GetWorkflowId())
 		}
+		return &streamRefusal{plain: plain, detail: notFound.Message, cause: err}
 	}
 	var exhausted *serviceerror.ResourceExhausted
 	if !errors.As(err, &exhausted) {
@@ -136,7 +171,20 @@ func notificationRow(n *notificationpb.Notification) (channelNotificationRow, er
 	}, nil
 }
 
+// channelKindText reads a server that predates the linked kind, and so leaves
+// the kind unset, as the independent channel it serves.
+func channelKindText(kind notificationpb.ChannelKind) string {
+	if kind == notificationpb.CHANNEL_KIND_UNSPECIFIED {
+		kind = notificationpb.CHANNEL_KIND_INDEPENDENT
+	}
+	return kind.String()
+}
+
 func (c *TemporalChannelNotifyCommand) run(cctx *CommandContext, _ []string) error {
+	target, err := c.target()
+	if err != nil {
+		return err
+	}
 	if c.Counter <= 0 {
 		return fmt.Errorf("--counter must be greater than zero")
 	}
@@ -158,22 +206,26 @@ func (c *TemporalChannelNotifyCommand) run(cctx *CommandContext, _ []string) err
 			Counter:  int64(c.Counter),
 			Metadata: metadata,
 		},
-		Identity:  c.Parent.Identity,
-		RequestId: uuid.NewString(),
+		Identity:          c.Parent.Identity,
+		RequestId:         uuid.NewString(),
+		WorkflowExecution: target.execution,
 	})
 	if err != nil {
-		return fmt.Errorf("failed notifying channel %q: %w",
-			c.Channel, plainChannelRefusal(err, c.Channel))
+		return fmt.Errorf("failed notifying %v: %w", target, plainChannelRefusal(err, target))
 	}
 	if cctx.JSONOutput {
 		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
 	}
-	cctx.Printer.Printlnf("Notified channel %v. Listeners reached: %v",
-		c.Channel, resp.GetListenerCount())
+	cctx.Printer.Printlnf("Notified %v. Listeners reached: %v",
+		target.label(), resp.GetListenerCount())
 	return nil
 }
 
 func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) error {
+	target, err := c.target()
+	if err != nil {
+		return err
+	}
 	cl, err := dialClient(cctx, &c.Parent.ClientOptions)
 	if err != nil {
 		return err
@@ -182,12 +234,12 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 
 	resp, err := cl.WorkflowService().DescribeChannel(cctx,
 		&workflowservice.DescribeChannelRequest{
-			Namespace: c.Parent.Namespace,
-			Channel:   c.Channel,
+			Namespace:         c.Parent.Namespace,
+			Channel:           c.Channel,
+			WorkflowExecution: target.execution,
 		})
 	if err != nil {
-		return fmt.Errorf("failed describing channel %q: %w",
-			c.Channel, plainChannelRefusal(err, c.Channel))
+		return fmt.Errorf("failed describing %v: %w", target, plainChannelRefusal(err, target))
 	}
 	if cctx.JSONOutput {
 		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
@@ -195,12 +247,18 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 
 	info := struct {
 		Channel        string
+		Kind           string
+		WorkflowId     string `cli:",cardOmitEmpty"`
+		RunId          string `cli:",cardOmitEmpty"`
 		RetainedCount  int32
 		LatestCounter  int64  `cli:",cardOmitEmpty"`
 		LatestPosition string `cli:",cardOmitEmpty"`
 		LatestMetadata string `cli:",cardOmitEmpty"`
 	}{
 		Channel:       c.Channel,
+		Kind:          channelKindText(resp.GetKind()),
+		WorkflowId:    resp.GetLinkedTo().GetWorkflowId(),
+		RunId:         resp.GetLinkedTo().GetRunId(),
 		RetainedCount: resp.GetRetainedCount(),
 	}
 	if latest := resp.GetLatest(); latest != nil {
@@ -231,7 +289,12 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 	var workflows []workflowRow
 	var callbacks []callbackRow
 	for _, l := range resp.GetListeners() {
-		registered := l.GetRegisteredTime().AsTime()
+		// A linked channel's owner never registered, so it has no time; the
+		// conversion would turn that into the Unix epoch.
+		var registered time.Time
+		if l.GetRegisteredTime() != nil {
+			registered = l.GetRegisteredTime().AsTime()
+		}
 		if wf := l.GetWorkflow(); wf != nil {
 			workflows = append(workflows, workflowRow{
 				ListenerId: l.GetListenerId(),
@@ -273,6 +336,10 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 }
 
 func (c *TemporalChannelListenerAddCommand) run(cctx *CommandContext, _ []string) error {
+	target, err := c.target()
+	if err != nil {
+		return err
+	}
 	if c.CallbackUrl == "" {
 		return fmt.Errorf("--callback-url cannot be empty")
 	}
@@ -297,21 +364,26 @@ func (c *TemporalChannelListenerAddCommand) run(cctx *CommandContext, _ []string
 					Header: headers,
 				}},
 			},
-			RequestId: uuid.NewString(),
-			Identity:  clientOpts.Identity,
+			RequestId:         uuid.NewString(),
+			Identity:          clientOpts.Identity,
+			WorkflowExecution: target.execution,
 		})
 	if err != nil {
-		return fmt.Errorf("failed adding a listener to channel %q: %w",
-			c.Channel, plainChannelRefusal(err, c.Channel))
+		return fmt.Errorf("failed adding a listener to %v: %w",
+			target, plainChannelRefusal(err, target))
 	}
 	if cctx.JSONOutput {
 		return cctx.Printer.PrintStructured(resp, printer.StructuredOptions{})
 	}
-	cctx.Printer.Printlnf("Added listener %v to channel %v", resp.GetListenerId(), c.Channel)
+	cctx.Printer.Printlnf("Added listener %v to %v", resp.GetListenerId(), target.label())
 	return nil
 }
 
 func (c *TemporalChannelListenerRemoveCommand) run(cctx *CommandContext, _ []string) error {
+	target, err := c.target()
+	if err != nil {
+		return err
+	}
 	clientOpts := &c.Parent.Parent.ClientOptions
 	cl, err := dialClient(cctx, clientOpts)
 	if err != nil {
@@ -321,16 +393,17 @@ func (c *TemporalChannelListenerRemoveCommand) run(cctx *CommandContext, _ []str
 
 	_, err = cl.WorkflowService().UnregisterChannelListener(cctx,
 		&workflowservice.UnregisterChannelListenerRequest{
-			Namespace:  clientOpts.Namespace,
-			Channel:    c.Channel,
-			ListenerId: c.ListenerId,
-			Identity:   clientOpts.Identity,
+			Namespace:         clientOpts.Namespace,
+			Channel:           c.Channel,
+			ListenerId:        c.ListenerId,
+			Identity:          clientOpts.Identity,
+			WorkflowExecution: target.execution,
 		})
 	if err != nil {
-		return fmt.Errorf("failed removing listener %q from channel %q: %w",
-			c.ListenerId, c.Channel, plainChannelRefusal(err, c.Channel))
+		return fmt.Errorf("failed removing listener %q from %v: %w",
+			c.ListenerId, target, plainChannelRefusal(err, target))
 	}
-	cctx.Printer.Printlnf("Removed listener %v from channel %v", c.ListenerId, c.Channel)
+	cctx.Printer.Printlnf("Removed listener %v from %v", c.ListenerId, target.label())
 	return nil
 }
 
@@ -341,7 +414,7 @@ type channelPoller struct {
 	ctx       context.Context
 	cl        client.Client
 	namespace string
-	channel   string
+	target    channelTarget
 	after     int64
 	wait      time.Duration
 	max       int32
@@ -357,8 +430,8 @@ func (p *channelPoller) next() (*notificationpb.Notification, error) {
 			if p.ctx.Err() != nil {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("failed polling channel %q: %w",
-				p.channel, plainChannelRefusal(err, p.channel))
+			return nil, fmt.Errorf("failed polling %v: %w",
+				p.target, plainChannelRefusal(err, p.target))
 		}
 	}
 	if len(p.buf) == 0 {
@@ -373,11 +446,12 @@ func (p *channelPoller) poll() error {
 	ctx, cancel := context.WithTimeout(p.ctx, p.wait+channelPollGrace)
 	defer cancel()
 	resp, err := p.cl.WorkflowService().PollChannel(ctx, &workflowservice.PollChannelRequest{
-		Namespace:        p.namespace,
-		Channel:          p.channel,
-		AfterCounter:     p.after,
-		Wait:             durationpb.New(p.wait),
-		MaxNotifications: p.max,
+		Namespace:         p.namespace,
+		Channel:           p.target.name,
+		AfterCounter:      p.after,
+		Wait:              durationpb.New(p.wait),
+		MaxNotifications:  p.max,
+		WorkflowExecution: p.target.execution,
 	})
 	p.polled = true
 	if err != nil {
@@ -407,6 +481,10 @@ func (i *channelRowIter) Next() (any, error) {
 }
 
 func (c *TemporalChannelPollCommand) run(cctx *CommandContext, _ []string) error {
+	target, err := c.target()
+	if err != nil {
+		return err
+	}
 	if c.AfterCounter < 0 {
 		return fmt.Errorf("--after-counter cannot be negative")
 	}
@@ -426,7 +504,7 @@ func (c *TemporalChannelPollCommand) run(cctx *CommandContext, _ []string) error
 		ctx:       cctx,
 		cl:        cl,
 		namespace: c.Parent.Namespace,
-		channel:   c.Channel,
+		target:    target,
 		after:     int64(c.AfterCounter),
 		wait:      c.Wait.Duration(),
 		max:       int32(c.Max),
@@ -466,8 +544,8 @@ func (c *TemporalChannelPollCommand) run(cctx *CommandContext, _ []string) error
 			rows = append(rows, row)
 		}
 		if len(rows) == 0 {
-			cctx.Printer.Printlnf("No notifications on channel %v after counter %v",
-				c.Channel, c.AfterCounter)
+			cctx.Printer.Printlnf("No notifications on %v after counter %v",
+				target.label(), c.AfterCounter)
 			return nil
 		}
 		return cctx.Printer.PrintStructured(rows, printer.StructuredOptions{

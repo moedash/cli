@@ -21,6 +21,8 @@ import (
 	notificationpb "go.temporal.io/api/notification/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/workflow"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -36,6 +38,7 @@ type fakeChannelService struct {
 	registers  []*workflowservice.RegisterChannelListenerRequest
 	unregister []*workflowservice.UnregisterChannelListenerRequest
 	polls      []*workflowservice.PollChannelRequest
+	describes  []*workflowservice.DescribeChannelRequest
 
 	err      error
 	describe *workflowservice.DescribeChannelResponse
@@ -89,8 +92,11 @@ func (f *fakeChannelService) UnregisterChannelListener(
 }
 
 func (f *fakeChannelService) DescribeChannel(
-	context.Context, *workflowservice.DescribeChannelRequest,
+	_ context.Context, req *workflowservice.DescribeChannelRequest,
 ) (*workflowservice.DescribeChannelResponse, error) {
+	f.mu.Lock()
+	f.describes = append(f.describes, req)
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -177,6 +183,14 @@ func TestChannel_ArgumentValidation(t *testing.T) {
 		{[]string{"poll", "-c", "ch", "--max", "-1"}, "cannot be negative"},
 		{[]string{"poll", "-c", "ch", "--wait", "0s"}, "--wait must be positive"},
 		{[]string{"describe"}, `"channel" not set`},
+		{[]string{"describe", "-c", "ch", "--run-id", "r1"}, "--run-id requires --workflow-id"},
+		{[]string{"notify", "-c", "ch", "--position", "1", "--counter", "1", "-r", "r1"},
+			"--run-id requires --workflow-id"},
+		{[]string{"poll", "-c", "ch", "-r", "r1"}, "--run-id requires --workflow-id"},
+		{[]string{"listener", "add", "-c", "ch", "--callback-url", "http://x", "-r", "r1"},
+			"--run-id requires --workflow-id"},
+		{[]string{"listener", "remove", "-c", "ch", "--listener-id", "l", "-r", "r1"},
+			"--run-id requires --workflow-id"},
 	} {
 		res := h.Execute(append(append([]string{"channel"}, tc.args...), "--address", addr)...)
 		require.Error(t, res.Err, tc.args)
@@ -187,6 +201,7 @@ func TestChannel_ArgumentValidation(t *testing.T) {
 	assert.Empty(t, f.registers)
 	assert.Empty(t, f.unregister)
 	assert.Empty(t, f.polls)
+	assert.Empty(t, f.describes)
 }
 
 func TestChannel_Notify(t *testing.T) {
@@ -608,4 +623,170 @@ func (s *SharedServerSuite) TestChannel_CallbackListenerRoundTrip() {
 func (s *SharedServerSuite) TestChannel_UnknownChannel() {
 	res := s.Execute("channel", "describe", "--address", s.Address(), "-c", "never-"+uuid.NewString())
 	s.ErrorContains(res.Err, "there is no channel")
+}
+
+func TestChannel_LinkedToWorkflow(t *testing.T) {
+	f := &fakeChannelService{
+		describe: &workflowservice.DescribeChannelResponse{
+			Kind:          notificationpb.CHANNEL_KIND_LINKED,
+			LinkedTo:      &commonpb.WorkflowExecution{WorkflowId: "wf-1", RunId: "run-9"},
+			RetainedCount: 1,
+			Latest:        &notificationpb.Notification{Channel: "ch", Position: []byte("p1"), Counter: 1},
+			Listeners: []*notificationpb.ChannelListener{{
+				ListenerId: "wf-1",
+				Listener: &notificationpb.ChannelListener_Workflow{
+					Workflow: &notificationpb.WorkflowListener{WorkflowId: "wf-1", RunId: "run-9"},
+				},
+			}},
+		},
+		pollAnswers: [][]*notificationpb.Notification{{{Channel: "ch", Counter: 1}}},
+	}
+	addr := startFakeChannelService(t, f)
+	h := NewCommandHarness(t)
+	linked := []string{"--address", addr, "-c", "ch", "--workflow-id", "wf-1"}
+
+	res := h.Execute(append([]string{"channel", "notify", "--position", "p1", "--counter", "1",
+		"--run-id", "run-9"}, linked...)...)
+	require.NoError(t, res.Err)
+	h.ContainsOnSameLine(res.Stdout.String(), "Notified channel ch of workflow wf-1")
+	res = h.Execute(append([]string{"channel", "describe"}, linked...)...)
+	require.NoError(t, res.Err)
+	out := res.Stdout.String()
+	h.ContainsOnSameLine(out, "Kind", "Linked")
+	h.ContainsOnSameLine(out, "WorkflowId", "wf-1")
+	h.ContainsOnSameLine(out, "RunId", "run-9")
+	h.ContainsOnSameLine(out, "RetainedCount", "1")
+	// The owner listens without registering, so its row has no time.
+	h.ContainsOnSameLine(out, "Workflow listeners: 1")
+	assert.NotContains(t, out, "ago")
+	res = h.Execute(append([]string{"channel", "poll"}, linked...)...)
+	require.NoError(t, res.Err)
+	res = h.Execute(append([]string{"channel", "listener", "add", "--callback-url",
+		"http://x"}, linked...)...)
+	require.NoError(t, res.Err)
+	h.ContainsOnSameLine(res.Stdout.String(), "to channel ch of workflow wf-1")
+	res = h.Execute(append([]string{"channel", "listener", "remove", "--listener-id",
+		"listener-7"}, linked...)...)
+	require.NoError(t, res.Err)
+
+	// Every call names the workflow; the run only where it was given.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Len(t, f.notifies, 1)
+	assert.Equal(t, "wf-1", f.notifies[0].GetWorkflowExecution().GetWorkflowId())
+	assert.Equal(t, "run-9", f.notifies[0].GetWorkflowExecution().GetRunId())
+	require.Len(t, f.describes, 1)
+	assert.Equal(t, "wf-1", f.describes[0].GetWorkflowExecution().GetWorkflowId())
+	assert.Empty(t, f.describes[0].GetWorkflowExecution().GetRunId())
+	require.Len(t, f.polls, 1)
+	assert.Equal(t, "wf-1", f.polls[0].GetWorkflowExecution().GetWorkflowId())
+	require.Len(t, f.registers, 1)
+	assert.Equal(t, "wf-1", f.registers[0].GetWorkflowExecution().GetWorkflowId())
+	require.Len(t, f.unregister, 1)
+	assert.Equal(t, "wf-1", f.unregister[0].GetWorkflowExecution().GetWorkflowId())
+}
+
+func TestChannel_IndependentByDefault(t *testing.T) {
+	f := &fakeChannelService{describe: &workflowservice.DescribeChannelResponse{}}
+	addr := startFakeChannelService(t, f)
+	h := NewCommandHarness(t)
+
+	res := h.Execute("channel", "notify", "--address", addr, "-c", "ch",
+		"--position", "p", "--counter", "1")
+	require.NoError(t, res.Err)
+	// A server that predates the linked kind leaves the kind unset.
+	res = h.Execute("channel", "describe", "--address", addr, "-c", "ch")
+	require.NoError(t, res.Err)
+	h.ContainsOnSameLine(res.Stdout.String(), "Kind", "Independent")
+	assert.NotContains(t, res.Stdout.String(), "WorkflowId")
+	assert.Nil(t, f.notifies[0].GetWorkflowExecution())
+	assert.Nil(t, f.describes[0].GetWorkflowExecution())
+}
+
+func TestChannel_LinkedNotFound(t *testing.T) {
+	f := &fakeChannelService{err: serviceerror.NewNotFound("workflow execution already completed")}
+	addr := startFakeChannelService(t, f)
+	h := NewCommandHarness(t)
+
+	res := h.Execute("channel", "notify", "--address", addr, "-c", "ch", "-w", "gone",
+		"--position", "p", "--counter", "1")
+	require.Error(t, res.Err)
+	assert.Contains(t, res.Err.Error(), `workflow "gone" has no running execution`)
+	assert.Contains(t, res.Err.Error(), `channel "ch" of workflow "gone"`)
+}
+
+func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {
+	s.Worker().OnDevWorkflow(func(ctx workflow.Context, a any) (any, error) {
+		workflow.GetSignalChannel(ctx, "finish").Receive(ctx, nil)
+		return nil, nil
+	})
+	run, err := s.Client.ExecuteWorkflow(
+		s.Context,
+		client.StartWorkflowOptions{TaskQueue: s.Worker().Options.TaskQueue},
+		DevWorkflow,
+		"ignored",
+	)
+	s.NoError(err)
+	ch := "channel-" + uuid.NewString()
+	linked := []string{"--address", s.Address(), "-c", ch, "--workflow-id", run.GetID()}
+	channel := func(args ...string) *CommandResult {
+		return s.Execute(append(append([]string{"channel"}, args...), linked...)...)
+	}
+
+	// The owner listens by construction, so the first notify reaches it.
+	res := channel("notify", "--position", "p1", "--counter", "1")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Listeners reached", "1")
+
+	res = channel("describe")
+	s.NoError(res.Err)
+	out := res.Stdout.String()
+	s.ContainsOnSameLine(out, "Kind", "Linked")
+	s.ContainsOnSameLine(out, "WorkflowId", run.GetID())
+	s.ContainsOnSameLine(out, "RunId", run.GetRunID())
+	s.ContainsOnSameLine(out, "RetainedCount", "1")
+	s.ContainsOnSameLine(out, "LatestPosition", "p1")
+	s.ContainsOnSameLine(out, "Workflow listeners: 1")
+
+	res = channel("poll", "--after-counter", "0", "--wait", "5s", "-o", "jsonl")
+	s.NoError(res.Err)
+	raw := decodeJSONValues(s.T(), res.Stdout.String())
+	s.Len(raw, 1)
+	var n notificationpb.Notification
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[0], &n, true))
+	s.Equal(int64(1), n.GetCounter())
+	s.Equal(run.GetID(), n.GetLinkedTo().GetWorkflowId())
+
+	res = channel("listener", "add", "--callback-url", "http://127.0.0.1:1/notify", "-o", "json")
+	s.NoError(res.Err)
+	var added workflowservice.RegisterChannelListenerResponse
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &added, true))
+	res = channel("describe")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Callback listeners: 1")
+	s.ContainsOnSameLine(res.Stdout.String(), added.GetListenerId(), "http://127.0.0.1:1/notify")
+	res = channel("listener", "remove", "--listener-id", added.GetListenerId())
+	s.NoError(res.Err)
+	res = channel("describe")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Callback listeners: 0")
+
+	// A name nobody has used still exists on a running workflow.
+	res = s.Execute("channel", "describe", "--address", s.Address(),
+		"-c", "untouched-"+uuid.NewString(), "--workflow-id", run.GetID())
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Kind", "Linked")
+	s.ContainsOnSameLine(res.Stdout.String(), "RetainedCount", "0")
+	s.ContainsOnSameLine(res.Stdout.String(), "Workflow listeners: 0")
+	s.ContainsOnSameLine(res.Stdout.String(), "Callback listeners: 0")
+
+	// The independent channel of the same name is a different channel.
+	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch)
+	s.ErrorContains(res.Err, "there is no channel")
+
+	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch, "--run-id", "r")
+	s.ErrorContains(res.Err, "--run-id requires --workflow-id")
+
+	s.NoError(s.Client.SignalWorkflow(s.Context, run.GetID(), "", "finish", nil))
+	s.NoError(run.Get(s.Context, nil))
 }
