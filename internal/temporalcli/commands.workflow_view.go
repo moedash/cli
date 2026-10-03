@@ -252,6 +252,9 @@ func (c *TemporalWorkflowDescribeCommand) run(cctx *CommandContext, args []strin
 	if err := printCallbacks(cctx, resp.Callbacks); err != nil {
 		return err
 	}
+	if err := printChannelSubscriptions(cctx, resp.ChannelSubscriptions); err != nil {
+		return err
+	}
 
 	if running {
 		cctx.Printer.Println()
