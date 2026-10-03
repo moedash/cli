@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"go.temporal.io/api/common/v1"
+	"go.temporal.io/api/temporalproto"
 )
 
 // CreatePayloads creates API Payload objects from given data and metadata slices.
@@ -39,4 +40,19 @@ func CreatePayloads(data [][]byte, metadata map[string][][]byte, isBase64 bool) 
 		ret.Payloads[i] = &common.Payload{Data: in, Metadata: metadataForIndex}
 	}
 	return ret, nil
+}
+
+// payloadText renders a payload for a table cell the way the printer renders
+// payloads elsewhere: shorthand, on one line.
+func payloadText(p *common.Payload) (string, error) {
+	if p == nil {
+		return "", nil
+	}
+	b, err := temporalproto.CustomJSONMarshalOptions{
+		Metadata: map[string]any{common.EnablePayloadShorthandMetadataKey: true},
+	}.Marshal(p)
+	if err != nil {
+		return "", fmt.Errorf("failed rendering payload: %w", err)
+	}
+	return string(b), nil
 }

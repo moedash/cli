@@ -950,6 +950,244 @@ commands:
         description: Reason for terminating the batch job.
         required: true
 
+  - name: temporal channel
+    summary: Notify and listen on notification channels
+    description: |
+      A notification channel is a name a writer and its listeners agree on.
+      The writer notifies the channel when a source it writes moves, such as
+      a Stream gaining records, and never learns who listens. A Workflow
+      listener gets a Workflow Task, a callback listener gets an HTTP call,
+      and a client long-polls:
+
+      ```
+      temporal channel [command] [options]
+      ```
+
+      For example:
+
+      ```
+      temporal channel poll \
+          --channel YourChannel \
+          --follow
+      ```
+
+      A notification tells listeners where the source stands. It carries no
+      data; the listener reads the source itself.
+
+      An independent channel exists on its own, and any number of Workflows,
+      callbacks and clients listen on it. A channel linked to a Workflow
+      Execution lives with that Workflow, which listens on it without
+      subscribing. A channel linked to a standalone Activity lives with that
+      Activity the same way. Name the owner with `--workflow-id` or
+      `--activity-id` on any channel command:
+
+      ```
+      temporal channel notify \
+          --channel YourChannel \
+          --workflow-id YourWorkflowId \
+          --position 42 \
+          --counter 42
+      ```
+    option-sets:
+      - client
+    docs:
+      description-header: >-
+        Temporal Channel commands notify a notification channel, poll it,
+        describe it, and add or remove its callback listeners.
+      keywords:
+        - channel
+        - channel describe
+        - channel listener add
+        - channel listener remove
+        - channel notify
+        - channel poll
+        - cli reference
+        - command-line-interface-cli
+        - notification channel
+        - temporal cli
+      tags:
+        - Temporal CLI
+        - Channels
+
+  - name: temporal channel describe
+    summary: Show a channel's listeners and latest notification
+    description: |
+      Show who listens on a channel, its latest notification, and how many
+      notifications it keeps for pollers:
+
+      ```
+      temporal channel describe \
+          --channel YourChannel
+      ```
+
+      An independent channel exists once a writer notifies it or a listener
+      registers on it, and goes away after a while without listeners or
+      activity. A channel linked to a running Workflow Execution or standalone
+      Activity always exists, and its description names that owner:
+
+      ```
+      temporal channel describe \
+          --channel YourChannel \
+          --workflow-id YourWorkflowId
+      ```
+    option-sets:
+      - channel
+
+  - name: temporal channel listener
+    summary: Add or remove a channel's callback listeners
+    description: |
+      Register a callback the Service calls with every notification on a
+      channel, or remove one:
+
+      ```
+      temporal channel listener [command] [options]
+      ```
+
+      A Workflow listens on a channel from its own code instead, and stops
+      listening when its run ends.
+
+  - name: temporal channel listener add
+    summary: Register a callback listener
+    description: |
+      Register a callback on a channel. The Service calls the URL with every
+      notification the channel gets from now on:
+
+      ```
+      temporal channel listener add \
+          --channel YourChannel \
+          --callback-url https://example.com/notify \
+          --header "Authorization=Bearer YourToken"
+      ```
+
+      The command prints the listener ID that `temporal channel listener
+      remove` takes.
+
+      The Service only calls addresses its `callback.allowedAddresses`
+      dynamic configuration value allows. The development server allows
+      `127.0.0.1` and `localhost` on any port over plain HTTP. Another
+      Service needs the address added, for example:
+
+      ```
+      --dynamic-config-value \
+          'callback.allowedAddresses=[{"Pattern":"*.example.com:443"}]'
+      ```
+    options:
+      - name: callback-url
+        type: string
+        description: URL the Service calls with each notification.
+        required: true
+      - name: header
+        type: string[]
+        description: |
+          Header sent with every call, in `KEY=VALUE` format.
+          Can be passed multiple times.
+    option-sets:
+      - channel
+
+  - name: temporal channel listener remove
+    summary: Remove a callback listener
+    description: |
+      Stop calling a callback listener:
+
+      ```
+      temporal channel listener remove \
+          --channel YourChannel \
+          --listener-id YourListenerId
+      ```
+
+      Find the listener ID with `temporal channel describe`.
+    options:
+      - name: listener-id
+        type: string
+        description: ID of the listener to remove.
+        required: true
+    option-sets:
+      - channel
+
+  - name: temporal channel notify
+    summary: Notify a channel's listeners
+    description: |
+      Tell every listener of a channel that its source moved. The command
+      prints how many listeners the notification reached:
+
+      ```
+      temporal channel notify \
+          --channel YourChannel \
+          --position 42 \
+          --counter 42 \
+          --metadata 'topic="scores"'
+      ```
+
+      The position is where the source stands now, in the writer's own
+      terms. The counter orders notifications on the channel: when several
+      wait for a listener at once, it gets the one with the highest counter.
+      Metadata values are JSON.
+    options:
+      - name: position
+        type: string
+        description: |
+          Where the source stands after the write.
+          Sent as text; the Service does not read it.
+        required: true
+      - name: counter
+        type: int
+        description: |
+          Order of this notification among the channel's notifications.
+          Must be greater than zero.
+        required: true
+      - name: metadata
+        type: string[]
+        description: |
+          Detail for listeners, in `KEY=VALUE` format.
+          Values must be JSON.
+          Can be passed multiple times.
+    option-sets:
+      - channel
+
+  - name: temporal channel poll
+    summary: Wait for a channel's notifications
+    description: |
+      Show the notifications a channel keeps, waiting for one when there is
+      none yet:
+
+      ```
+      temporal channel poll \
+          --channel YourChannel
+      ```
+
+      Keep polling and print notifications as they arrive:
+
+      ```
+      temporal channel poll \
+          --channel YourChannel \
+          --after-counter 10 \
+          --follow
+      ```
+
+      Each notification prints with its counter, position and metadata. With
+      `--output json` each notification is one JSON object.
+    options:
+      - name: after-counter
+        type: int
+        description: Show only notifications with a counter above this one.
+      - name: wait
+        type: duration
+        description: |
+          How long one poll waits for a notification when there is none.
+          The Service may answer sooner.
+        default: 30s
+      - name: max
+        type: int
+        description: |
+          Most notifications one poll returns.
+          Default is zero (the Service's limit).
+      - name: follow
+        short: f
+        type: bool
+        description: Keep polling from the last counter seen until interrupted.
+    option-sets:
+      - channel
+
   - name: temporal config
     summary: Manage config files (EXPERIMENTAL)
     description: |
@@ -5391,6 +5629,32 @@ option-sets:
         type: string
         short: r
         description: Run ID.
+
+  - name: channel
+    options:
+      - name: channel
+        type: string
+        short: c
+        description: Name of the notification channel.
+        required: true
+      - name: workflow-id
+        type: string
+        short: w
+        description: |
+          Workflow ID of the Workflow Execution the channel is linked to.
+          Without an owner the command uses the independent channel of that name.
+          Cannot use with --activity-id.
+      - name: activity-id
+        type: string
+        description: |
+          Activity ID of the standalone Activity the channel is linked to.
+          Cannot use with --workflow-id.
+      - name: run-id
+        type: string
+        short: r
+        description: |
+          Run ID of the linked execution.
+          Defaults to the current run. Requires --workflow-id or --activity-id.
 
   - name: deployment-name
     options:
