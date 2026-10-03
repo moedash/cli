@@ -114,6 +114,35 @@ func (v *ChannelOptions) BuildFlags(f *pflag.FlagSet) {
 	f.StringVarP(&v.RunId, "run-id", "r", "", "Run ID of the linked execution. Defaults to the current run. Requires --workflow-id or --activity-id.")
 }
 
+type StreamIdOptions struct {
+	StreamId string
+	FlagSet  *pflag.FlagSet
+}
+
+func (v *StreamIdOptions) BuildFlags(f *pflag.FlagSet) {
+	v.FlagSet = f
+	f.StringVarP(&v.StreamId, "stream-id", "s", "", "Stream ID of a standalone Stream. Required.")
+	_ = cobra.MarkFlagRequired(f, "stream-id")
+}
+
+type StreamReferenceOptions struct {
+	StreamId   string
+	WorkflowId string
+	RunId      string
+	ActivityId string
+	Name       string
+	FlagSet    *pflag.FlagSet
+}
+
+func (v *StreamReferenceOptions) BuildFlags(f *pflag.FlagSet) {
+	v.FlagSet = f
+	f.StringVarP(&v.StreamId, "stream-id", "s", "", "Stream ID of a standalone Stream. You must set either --stream-id or an owner.")
+	f.StringVarP(&v.WorkflowId, "workflow-id", "w", "", "Workflow ID of the Workflow Execution owning the Stream. Cannot use with --stream-id.")
+	f.StringVarP(&v.RunId, "run-id", "r", "", "Run ID of the owner. Defaults to the current run.")
+	f.StringVar(&v.ActivityId, "activity-id", "", "Activity ID of the Activity owning the Stream. With --workflow-id it names an Activity the Workflow scheduled. On its own it names a standalone Activity.")
+	f.StringVar(&v.Name, "name", "", "Name of the Stream within its owner. Defaults to the owner's default Stream.")
+}
+
 type DeploymentNameOptions struct {
 	Name    string
 	FlagSet *pflag.FlagSet
@@ -554,6 +583,7 @@ func NewTemporalCommand(cctx *CommandContext) *TemporalCommand {
 	s.Command.AddCommand(&NewTemporalOperatorCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalScheduleCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalServerCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalTaskQueueCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalWorkerCommand(cctx, &s).Command)
 	s.Command.AddCommand(&NewTemporalWorkflowCommand(cctx, &s).Command)
@@ -3095,6 +3125,298 @@ func NewTemporalServerStartDevCommand(cctx *CommandContext, parent *TemporalServ
 	s.Command.Flags().StringArrayVar(&s.DynamicConfigValue, "dynamic-config-value", nil, "Dynamic configuration value using `KEY=VALUE` pairs. Keys must be identifiers, and values must be JSON values. For example: `YourKey=\"YourString\"` Can be passed multiple times.")
 	s.Command.Flags().BoolVar(&s.LogConfig, "log-config", false, "Print the server config to stderr.")
 	s.Command.Flags().StringArrayVar(&s.SearchAttribute, "search-attribute", nil, "Search attributes to register using `KEY=VALUE` pairs. Keys must be identifiers, and values must be the search attribute type, which is one of the following: Text, Keyword, Int, Double, Bool, Datetime, KeywordList.")
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamCommand struct {
+	Parent  *TemporalCommand
+	Command cobra.Command
+	cliext.ClientOptions
+}
+
+func NewTemporalStreamCommand(cctx *CommandContext, parent *TemporalCommand) *TemporalStreamCommand {
+	var s TemporalStreamCommand
+	s.Parent = parent
+	s.Command.Use = "stream"
+	s.Command.Short = "Read and manage Streams"
+	if hasHighlighting {
+		s.Command.Long = "A Stream is an append-only log the Temporal Service carries next to\nWorkflow Executions. A standalone Stream has an ID of its own. An owned\nStream lives inside a Workflow Execution or an Activity and is addressed\nby its owner and a Stream name:\n\n\x1b[1mtemporal stream [command] [options]\x1b[0m\n\nFor example:\n\n\x1b[1mtemporal stream read \\\n    --workflow-id YourWorkflowId\x1b[0m\n\nThe Service must enable Streams for the Namespace through the\n\x1b[1mstream.enabled\x1b[0m dynamic configuration value. The development server\nenables them."
+	} else {
+		s.Command.Long = "A Stream is an append-only log the Temporal Service carries next to\nWorkflow Executions. A standalone Stream has an ID of its own. An owned\nStream lives inside a Workflow Execution or an Activity and is addressed\nby its owner and a Stream name:\n\n```\ntemporal stream [command] [options]\n```\n\nFor example:\n\n```\ntemporal stream read \\\n    --workflow-id YourWorkflowId\n```\n\nThe Service must enable Streams for the Namespace through the\n`stream.enabled` dynamic configuration value. The development server\nenables them."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.AddCommand(&NewTemporalStreamAppendCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamCloseCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamCreateCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamDeleteCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamDescribeCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamListCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamReadCommand(cctx, &s).Command)
+	s.Command.AddCommand(&NewTemporalStreamTruncateCommand(cctx, &s).Command)
+	s.ClientOptions.BuildFlags(s.Command.PersistentFlags())
+	s.ClientOptions.HideFlags()
+	return &s
+}
+
+type TemporalStreamAppendCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamReferenceOptions
+	PayloadInputOptions
+	Topic          string
+	ProducerId     string
+	Attempt        int
+	Sequence       int
+	ExpectedOffset int
+	Finish         bool
+}
+
+func NewTemporalStreamAppendCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamAppendCommand {
+	var s TemporalStreamAppendCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "append [flags]"
+	s.Command.Short = "Append records to a Stream"
+	if hasHighlighting {
+		s.Command.Long = "Append one or more records to a Stream. Each \x1b[1m--input\x1b[0m is one record.\nWithout \x1b[1m--input\x1b[0m or \x1b[1m--input-file\x1b[0m, one record is read per line from\nstdin:\n\n\x1b[1mtemporal stream append \\\n    --stream-id YourStreamId \\\n    --input '{\"score\": 1}' \\\n    --input '{\"score\": 2}'\x1b[0m\n\nAppend to a Stream a Workflow Execution owns, naming the owner instead:\n\n\x1b[1mtemporal stream append \\\n    --workflow-id YourWorkflowId \\\n    --name scores \\\n    --input '{\"score\": 1}'\x1b[0m\n\nSet \x1b[1m--producer-id\x1b[0m and \x1b[1m--sequence\x1b[0m so a retried append is deduplicated\nrather than appended twice. Pass \x1b[1m--finish\x1b[0m to end the producer's writes\non the topic with a \x1b[1mFINISH\x1b[0m record after the values."
+	} else {
+		s.Command.Long = "Append one or more records to a Stream. Each `--input` is one record.\nWithout `--input` or `--input-file`, one record is read per line from\nstdin:\n\n```\ntemporal stream append \\\n    --stream-id YourStreamId \\\n    --input '{\"score\": 1}' \\\n    --input '{\"score\": 2}'\n```\n\nAppend to a Stream a Workflow Execution owns, naming the owner instead:\n\n```\ntemporal stream append \\\n    --workflow-id YourWorkflowId \\\n    --name scores \\\n    --input '{\"score\": 1}'\n```\n\nSet `--producer-id` and `--sequence` so a retried append is deduplicated\nrather than appended twice. Pass `--finish` to end the producer's writes\non the topic with a `FINISH` record after the values."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVar(&s.Topic, "topic", "", "Topic label stored on every record.")
+	s.Command.Flags().StringVar(&s.ProducerId, "producer-id", "", "Producer identity stored on every record. Together with --sequence it deduplicates a retried append.")
+	s.Command.Flags().IntVar(&s.Attempt, "attempt", 0, "Producer attempt stored on every record.")
+	s.Command.Flags().IntVar(&s.Sequence, "sequence", 0, "Sequence of the first record within the producer's attempt. Records that follow take the next numbers.")
+	s.Command.Flags().IntVar(&s.ExpectedOffset, "expected-offset", 0, "Refuse the append unless the Stream's next offset equals this value. Only applies to a standalone Stream.")
+	s.Command.Flags().BoolVar(&s.Finish, "finish", false, "Append a `FINISH` record after the values.")
+	s.StreamReferenceOptions.BuildFlags(s.Command.Flags())
+	s.PayloadInputOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamCloseCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamIdOptions
+	Reason string
+}
+
+func NewTemporalStreamCloseCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamCloseCommand {
+	var s TemporalStreamCloseCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "close [flags]"
+	s.Command.Short = "Close a Stream"
+	if hasHighlighting {
+		s.Command.Long = "Close a standalone Stream. A closed Stream accepts no more records and\nstays readable until its retention passes:\n\n\x1b[1mtemporal stream close \\\n    --stream-id YourStreamId \\\n    --reason \"done\"\x1b[0m"
+	} else {
+		s.Command.Long = "Close a standalone Stream. A closed Stream accepts no more records and\nstays readable until its retention passes:\n\n```\ntemporal stream close \\\n    --stream-id YourStreamId \\\n    --reason \"done\"\n```"
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVar(&s.Reason, "reason", "", "Reason recorded on the Stream.")
+	s.StreamIdOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamCreateCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamIdOptions
+	Retention cliext.FlagDuration
+	MaxItems  int
+	MaxBytes  int
+}
+
+func NewTemporalStreamCreateCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamCreateCommand {
+	var s TemporalStreamCreateCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "create [flags]"
+	s.Command.Short = "Create a standalone Stream"
+	if hasHighlighting {
+		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n\x1b[1mtemporal stream create \\\n    --stream-id YourStreamId\x1b[0m\n\nRecords older than \x1b[1m--retention\x1b[0m are reclaimed, and a closed Stream is\ndeleted once it passes. Without it the Namespace's retention applies.\nCreating a Stream that already exists with the same lifecycle is an\nidempotent retry; a different lifecycle is refused."
+	} else {
+		s.Command.Long = "Create a standalone Stream with an ID of its own:\n\n```\ntemporal stream create \\\n    --stream-id YourStreamId\n```\n\nRecords older than `--retention` are reclaimed, and a closed Stream is\ndeleted once it passes. Without it the Namespace's retention applies.\nCreating a Stream that already exists with the same lifecycle is an\nidempotent retry; a different lifecycle is refused."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Retention = 0
+	s.Command.Flags().Var(&s.Retention, "retention", "How long a record stays readable, and how long a closed Stream stays readable before it is deleted. Cannot be longer than the Namespace's retention.")
+	s.Command.Flags().IntVar(&s.MaxItems, "max-items", 0, "Most records the Stream holds before the oldest are reclaimed. Default is zero (unbounded).")
+	s.Command.Flags().IntVar(&s.MaxBytes, "max-bytes", 0, "Most bytes the Stream holds. An append past it is refused until records are reclaimed. Default is zero (unbounded).")
+	s.StreamIdOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamDeleteCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamIdOptions
+	Force bool
+}
+
+func NewTemporalStreamDeleteCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamDeleteCommand {
+	var s TemporalStreamDeleteCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "delete [flags]"
+	s.Command.Short = "Remove a Stream"
+	if hasHighlighting {
+		s.Command.Long = "Delete a standalone Stream and every record it holds:\n\n\x1b[1mtemporal stream delete \\\n    --stream-id YourStreamId\x1b[0m\n\nThe call is refused while a Workflow Execution consumes the Stream,\nbecause its replay depends on the records. Pass \x1b[1m--force\x1b[0m to delete it\nanyway."
+	} else {
+		s.Command.Long = "Delete a standalone Stream and every record it holds:\n\n```\ntemporal stream delete \\\n    --stream-id YourStreamId\n```\n\nThe call is refused while a Workflow Execution consumes the Stream,\nbecause its replay depends on the records. Pass `--force` to delete it\nanyway."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().BoolVar(&s.Force, "force", false, "Delete even while a Workflow Execution consumes the Stream.")
+	s.StreamIdOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamDescribeCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamReferenceOptions
+}
+
+func NewTemporalStreamDescribeCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamDescribeCommand {
+	var s TemporalStreamDescribeCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "describe [flags]"
+	s.Command.Short = "Show a Stream's state"
+	if hasHighlighting {
+		s.Command.Long = "Show a Stream's frontier, floor, close state, retention, producers and\nconsumers:\n\n\x1b[1mtemporal stream describe \\\n    --stream-id YourStreamId\x1b[0m\n\nDescribe a Stream a Workflow Execution owns:\n\n\x1b[1mtemporal stream describe \\\n    --workflow-id YourWorkflowId \\\n    --name scores\x1b[0m\n\nThe output also names the notification channel the Stream notifies on\neach append and on its close. The name follows from the Stream alone,\nso no call to the Service is needed. A Stream a Workflow Execution\nowns notifies \x1b[1mstream/NAME\x1b[0m, linked to the owner. A Stream of an\nActivity the Workflow scheduled notifies \x1b[1mstream/ACTIVITY_ID/NAME\x1b[0m,\nlinked to the owner too. A standalone Stream notifies the independent\nchannel \x1b[1mstream/STREAM_ID\x1b[0m. Pass the channel, and the owner of a\nlinked one, to \x1b[1mtemporal channel poll\x1b[0m to follow the Stream:\n\n\x1b[1mtemporal channel poll \\\n    --channel stream/scores \\\n    --workflow-id YourWorkflowId\x1b[0m"
+	} else {
+		s.Command.Long = "Show a Stream's frontier, floor, close state, retention, producers and\nconsumers:\n\n```\ntemporal stream describe \\\n    --stream-id YourStreamId\n```\n\nDescribe a Stream a Workflow Execution owns:\n\n```\ntemporal stream describe \\\n    --workflow-id YourWorkflowId \\\n    --name scores\n```\n\nThe output also names the notification channel the Stream notifies on\neach append and on its close. The name follows from the Stream alone,\nso no call to the Service is needed. A Stream a Workflow Execution\nowns notifies `stream/NAME`, linked to the owner. A Stream of an\nActivity the Workflow scheduled notifies `stream/ACTIVITY_ID/NAME`,\nlinked to the owner too. A standalone Stream notifies the independent\nchannel `stream/STREAM_ID`. Pass the channel, and the owner of a\nlinked one, to `temporal channel poll` to follow the Stream:\n\n```\ntemporal channel poll \\\n    --channel stream/scores \\\n    --workflow-id YourWorkflowId\n```"
+	}
+	s.Command.Args = cobra.NoArgs
+	s.StreamReferenceOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamListCommand struct {
+	Parent   *TemporalStreamCommand
+	Command  cobra.Command
+	Query    string
+	Limit    int
+	PageSize int
+}
+
+func NewTemporalStreamListCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamListCommand {
+	var s TemporalStreamListCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "list [flags]"
+	s.Command.Short = "Show standalone Streams"
+	if hasHighlighting {
+		s.Command.Long = "List the standalone Streams in a Namespace. The optional \x1b[1m--query\x1b[0m\nlimits the output to Streams matching a List Filter, where \x1b[1mWorkflowId\x1b[0m\nholds the Stream ID:\n\n\x1b[1mtemporal stream list \\\n    --query 'WorkflowId STARTS_WITH \"scores-\"'\x1b[0m\n\nStreams a Workflow Execution owns are not listed here. Describe or read\nthem through their owner."
+	} else {
+		s.Command.Long = "List the standalone Streams in a Namespace. The optional `--query`\nlimits the output to Streams matching a List Filter, where `WorkflowId`\nholds the Stream ID:\n\n```\ntemporal stream list \\\n    --query 'WorkflowId STARTS_WITH \"scores-\"'\n```\n\nStreams a Workflow Execution owns are not listed here. Describe or read\nthem through their owner."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().StringVarP(&s.Query, "query", "q", "", "Content for an SQL-like `QUERY` List Filter.")
+	s.Command.Flags().IntVar(&s.Limit, "limit", 0, "Maximum number of Streams to display.")
+	s.Command.Flags().IntVar(&s.PageSize, "page-size", 100, "Maximum number of Streams to fetch at a time from the server.")
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamReadCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamReferenceOptions
+	FromOffset int
+	FromTail   bool
+	Last       int
+	Follow     bool
+	Topic      []string
+	Limit      int
+	PageSize   int
+}
+
+func NewTemporalStreamReadCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamReadCommand {
+	var s TemporalStreamReadCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "read [flags]"
+	s.Command.Short = "Read a Stream's records"
+	if hasHighlighting {
+		s.Command.Long = "Read a Stream from the beginning and stop once caught up:\n\n\x1b[1mtemporal stream read \\\n    --stream-id YourStreamId\x1b[0m\n\nRead a Stream a Workflow Execution owns and keep following it as records\nland:\n\n\x1b[1mtemporal stream read \\\n    --workflow-id YourWorkflowId \\\n    --name scores \\\n    --follow\x1b[0m\n\nStart at a cursor with \x1b[1m--from-offset\x1b[0m, at the tail with \x1b[1m--from-tail\x1b[0m,\nor at the newest records with \x1b[1m--last\x1b[0m. Each record prints with its\noffset, kind, topic, producer, attempt, sequence and body. With\n\x1b[1m--output json\x1b[0m each record is one JSON object."
+	} else {
+		s.Command.Long = "Read a Stream from the beginning and stop once caught up:\n\n```\ntemporal stream read \\\n    --stream-id YourStreamId\n```\n\nRead a Stream a Workflow Execution owns and keep following it as records\nland:\n\n```\ntemporal stream read \\\n    --workflow-id YourWorkflowId \\\n    --name scores \\\n    --follow\n```\n\nStart at a cursor with `--from-offset`, at the tail with `--from-tail`,\nor at the newest records with `--last`. Each record prints with its\noffset, kind, topic, producer, attempt, sequence and body. With\n`--output json` each record is one JSON object."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().IntVar(&s.FromOffset, "from-offset", 0, "Offset to start at, inclusive. Refused when below the Stream's floor.")
+	s.Command.Flags().BoolVar(&s.FromTail, "from-tail", false, "Start at the tail and show only records appended from now on.")
+	s.Command.Flags().IntVar(&s.Last, "last", 0, "Start at the newest records, showing at most this many first.")
+	s.Command.Flags().BoolVarP(&s.Follow, "follow", "f", false, "Keep reading as records land, until the Stream closes.")
+	s.Command.Flags().StringArrayVar(&s.Topic, "topic", nil, "Show only records on this topic. Can be passed multiple times.")
+	s.Command.Flags().IntVar(&s.Limit, "limit", 0, "Maximum number of records to display.")
+	s.Command.Flags().IntVar(&s.PageSize, "page-size", 100, "Maximum number of records to fetch at a time from the server.")
+	s.StreamReferenceOptions.BuildFlags(s.Command.Flags())
+	s.Command.Run = func(c *cobra.Command, args []string) {
+		if err := s.run(cctx, args); err != nil {
+			cctx.Options.Fail(err)
+		}
+	}
+	return &s
+}
+
+type TemporalStreamTruncateCommand struct {
+	Parent  *TemporalStreamCommand
+	Command cobra.Command
+	StreamIdOptions
+	To int
+}
+
+func NewTemporalStreamTruncateCommand(cctx *CommandContext, parent *TemporalStreamCommand) *TemporalStreamTruncateCommand {
+	var s TemporalStreamTruncateCommand
+	s.Parent = parent
+	s.Command.DisableFlagsInUseLine = true
+	s.Command.Use = "truncate [flags]"
+	s.Command.Short = "Drop the oldest records of a Stream"
+	if hasHighlighting {
+		s.Command.Long = "Move the readable floor of a standalone Stream up to an offset. Records\nbelow it are gone:\n\n\x1b[1mtemporal stream truncate \\\n    --stream-id YourStreamId \\\n    --to 100\x1b[0m\n\nThe call is refused while a Workflow Execution consumes records below\nthe new floor."
+	} else {
+		s.Command.Long = "Move the readable floor of a standalone Stream up to an offset. Records\nbelow it are gone:\n\n```\ntemporal stream truncate \\\n    --stream-id YourStreamId \\\n    --to 100\n```\n\nThe call is refused while a Workflow Execution consumes records below\nthe new floor."
+	}
+	s.Command.Args = cobra.NoArgs
+	s.Command.Flags().IntVar(&s.To, "to", 0, "New floor. Records below this offset are dropped. Required.")
+	_ = cobra.MarkFlagRequired(s.Command.Flags(), "to")
+	s.StreamIdOptions.BuildFlags(s.Command.Flags())
 	s.Command.Run = func(c *cobra.Command, args []string) {
 		if err := s.run(cctx, args); err != nil {
 			cctx.Options.Fail(err)
