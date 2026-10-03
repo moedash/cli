@@ -3619,6 +3619,14 @@ commands:
           --ui-port 3000
       ```
 
+      Streams are enabled on the development server. Turn them off with a
+      dynamic configuration value:
+
+      ```
+      temporal server start-dev \
+          --dynamic-config-value 'stream.enabled=false'
+      ```
+
       Callbacks to `127.0.0.1` and `localhost` on any port are allowed over
       plain HTTP, so a local receiver can listen on a notification channel.
       Replace the list with a dynamic configuration value:

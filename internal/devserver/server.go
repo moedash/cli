@@ -41,6 +41,7 @@ import (
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/server/chasm/lib/activity"
 	chasmcallback "go.temporal.io/server/chasm/lib/callback"
+	"go.temporal.io/server/chasm/lib/stream"
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/config"
@@ -251,6 +252,10 @@ func (s *StartOptions) buildServerOptions() ([]temporal.ServerOption, *slog.Leve
 	dynConf[activity.EnableStandaloneActivityOperatorCommands.Key()] = true
 	dynConf[dynamicconfig.FrontendEnableBatchOperationsForStandaloneActivities.Key()] = true
 
+	// The server ships streams off so a deployment opts in. The dev server is
+	// the opt-in: local development is what it exists for, and an explicit
+	// value below still wins.
+	dynConf[stream.EnabledSetting.Key()] = true
 	// The server calls no callback address until one is allowed. A local
 	// receiver is the usual target of a notification channel's callback on
 	// a dev server, and it rarely serves TLS.
