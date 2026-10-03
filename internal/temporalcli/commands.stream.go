@@ -16,6 +16,7 @@ import (
 	"github.com/temporalio/cli/cliext"
 	"github.com/temporalio/cli/internal/printer"
 	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
 	notificationpb "go.temporal.io/api/notification/v1"
 	"go.temporal.io/api/serviceerror"
 	streamapi "go.temporal.io/api/stream/v1"
@@ -122,7 +123,7 @@ const streamChannelPrefix = "stream/"
 type streamChannel struct {
 	name  string
 	kind  notificationpb.ChannelKind
-	owner *commonpb.WorkflowExecution
+	owner *commonpb.Execution
 }
 
 func (t streamTarget) channel() streamChannel {
@@ -132,19 +133,30 @@ func (t streamTarget) channel() streamChannel {
 			kind: notificationpb.CHANNEL_KIND_INDEPENDENT,
 		}
 	}
-	owner := &commonpb.WorkflowExecution{WorkflowId: t.owner.GetId(), RunId: t.owner.GetRunId()}
+	owner := &commonpb.Execution{
+		Type:       enumspb.EXECUTION_TYPE_WORKFLOW,
+		BusinessId: t.owner.GetId(),
+		RunId:      t.owner.GetRunId(),
+	}
 	switch t.owner.GetKind() {
 	case streampb.STREAM_OWNER_KIND_WORKFLOW_ACTIVITY:
+		// The activity's stream notifies the workflow that scheduled it, so the
+		// activity ID is in the name and the workflow is the owner.
 		return streamChannel{
 			name:  streamChannelPrefix + t.owner.GetActivityId() + "/" + t.resolvedName(),
 			kind:  notificationpb.CHANNEL_KIND_LINKED,
 			owner: owner,
 		}
 	case streampb.STREAM_OWNER_KIND_ACTIVITY:
-		// A standalone activity has no linked channels of its own.
+		// A standalone activity is an execution that holds linked channels of
+		// its own, since the server resolves the channel's owner from the
+		// execution a request names. Its stream's channel then needs no
+		// activity ID in the name.
+		owner.Type = enumspb.EXECUTION_TYPE_ACTIVITY
 		return streamChannel{
-			name: streamChannelPrefix + t.owner.GetId() + "/" + t.resolvedName(),
-			kind: notificationpb.CHANNEL_KIND_INDEPENDENT,
+			name:  streamChannelPrefix + t.resolvedName(),
+			kind:  notificationpb.CHANNEL_KIND_LINKED,
+			owner: owner,
 		}
 	default:
 		return streamChannel{
@@ -527,15 +539,13 @@ func (c *TemporalStreamDescribeCommand) run(cctx *CommandContext, _ []string) er
 	cctx.Printer.Println()
 	cctx.Printer.Println(color.MagentaString("Notification Channel:"))
 	if err := cctx.Printer.PrintStructured(struct {
-		Channel    string
-		Kind       string
-		WorkflowId string `cli:",cardOmitEmpty"`
-		RunId      string `cli:",cardOmitEmpty"`
+		Channel  string
+		Kind     string
+		LinkedTo string `cli:",cardOmitEmpty"`
 	}{
-		Channel:    ch.name,
-		Kind:       ch.kind.String(),
-		WorkflowId: ch.owner.GetWorkflowId(),
-		RunId:      ch.owner.GetRunId(),
+		Channel:  ch.name,
+		Kind:     ch.kind.String(),
+		LinkedTo: executionText(ch.owner),
 	}, printer.StructuredOptions{}); err != nil {
 		return err
 	}

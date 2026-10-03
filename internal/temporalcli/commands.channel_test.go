@@ -209,14 +209,21 @@ func TestChannel_ArgumentValidation(t *testing.T) {
 		{[]string{"poll", "-c", "ch", "--max", "-1"}, "cannot be negative"},
 		{[]string{"poll", "-c", "ch", "--wait", "0s"}, "--wait must be positive"},
 		{[]string{"describe"}, `"channel" not set`},
-		{[]string{"describe", "-c", "ch", "--run-id", "r1"}, "--run-id requires --workflow-id"},
+		{[]string{"describe", "-c", "ch", "--run-id", "r1"},
+			"--run-id requires --workflow-id or --activity-id"},
 		{[]string{"notify", "-c", "ch", "--position", "1", "--counter", "1", "-r", "r1"},
-			"--run-id requires --workflow-id"},
-		{[]string{"poll", "-c", "ch", "-r", "r1"}, "--run-id requires --workflow-id"},
+			"--run-id requires --workflow-id or --activity-id"},
+		{[]string{"poll", "-c", "ch", "-r", "r1"}, "--run-id requires --workflow-id or --activity-id"},
 		{[]string{"listener", "add", "-c", "ch", "--callback-url", "http://x", "-r", "r1"},
-			"--run-id requires --workflow-id"},
+			"--run-id requires --workflow-id or --activity-id"},
 		{[]string{"listener", "remove", "-c", "ch", "--listener-id", "l", "-r", "r1"},
-			"--run-id requires --workflow-id"},
+			"--run-id requires --workflow-id or --activity-id"},
+		{[]string{"describe", "-c", "ch", "-w", "wf", "--activity-id", "act"},
+			"--workflow-id and --activity-id name different owners"},
+		{[]string{"notify", "-c", "ch", "--position", "1", "--counter", "1", "-w", "wf",
+			"--activity-id", "act"}, "--workflow-id and --activity-id name different owners"},
+		{[]string{"poll", "-c", "ch", "-w", "wf", "--activity-id", "act"},
+			"--workflow-id and --activity-id name different owners"},
 	} {
 		res := h.Execute(append(append([]string{"channel"}, tc.args...), "--address", addr)...)
 		require.Error(t, res.Err, tc.args)
@@ -651,11 +658,44 @@ func (s *SharedServerSuite) TestChannel_UnknownChannel() {
 	s.ErrorContains(res.Err, "there is no channel")
 }
 
+func workflowExecution(id, run string) *commonpb.Execution {
+	return &commonpb.Execution{
+		Type: enumspb.EXECUTION_TYPE_WORKFLOW, BusinessId: id, RunId: run,
+	}
+}
+
+func activityExecution(id, run string) *commonpb.Execution {
+	return &commonpb.Execution{
+		Type: enumspb.EXECUTION_TYPE_ACTIVITY, BusinessId: id, RunId: run,
+	}
+}
+
+// linkedChannelRequests checks that every call named the owner with the type
+// its flag stands for, and the run only where it was given.
+func linkedChannelRequests(t *testing.T, f *fakeChannelService, want *commonpb.Execution) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	withRun := []*commonpb.Execution{f.notifies[0].GetExecution()}
+	withoutRun := []*commonpb.Execution{
+		f.describes[0].GetExecution(), f.polls[0].GetExecution(),
+		f.registers[0].GetExecution(), f.unregister[0].GetExecution(),
+	}
+	for _, got := range append(withRun, withoutRun...) {
+		assert.Equal(t, want.GetType(), got.GetType())
+		assert.Equal(t, want.GetBusinessId(), got.GetBusinessId())
+	}
+	assert.Equal(t, want.GetRunId(), withRun[0].GetRunId())
+	for _, got := range withoutRun {
+		assert.Empty(t, got.GetRunId())
+	}
+}
+
 func TestChannel_LinkedToWorkflow(t *testing.T) {
 	f := &fakeChannelService{
 		describe: &workflowservice.DescribeChannelResponse{
 			Kind:          notificationpb.CHANNEL_KIND_LINKED,
-			LinkedTo:      &commonpb.WorkflowExecution{WorkflowId: "wf-1", RunId: "run-9"},
+			LinkedTo:      workflowExecution("wf-1", "run-9"),
 			RetainedCount: 1,
 			Latest:        &notificationpb.Notification{Channel: "ch", Position: []byte("p1"), Counter: 1},
 			Listeners: []*notificationpb.ChannelListener{{
@@ -679,8 +719,7 @@ func TestChannel_LinkedToWorkflow(t *testing.T) {
 	require.NoError(t, res.Err)
 	out := res.Stdout.String()
 	h.ContainsOnSameLine(out, "Kind", "Linked")
-	h.ContainsOnSameLine(out, "WorkflowId", "wf-1")
-	h.ContainsOnSameLine(out, "RunId", "run-9")
+	h.ContainsOnSameLine(out, "LinkedTo", "workflow wf-1 (run run-9)")
 	h.ContainsOnSameLine(out, "RetainedCount", "1")
 	// The owner listens without registering, so its row has no time.
 	h.ContainsOnSameLine(out, "Workflow listeners: 1")
@@ -695,21 +734,54 @@ func TestChannel_LinkedToWorkflow(t *testing.T) {
 		"listener-7"}, linked...)...)
 	require.NoError(t, res.Err)
 
-	// Every call names the workflow; the run only where it was given.
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	require.Len(t, f.notifies, 1)
-	assert.Equal(t, "wf-1", f.notifies[0].GetWorkflowExecution().GetWorkflowId())
-	assert.Equal(t, "run-9", f.notifies[0].GetWorkflowExecution().GetRunId())
-	require.Len(t, f.describes, 1)
-	assert.Equal(t, "wf-1", f.describes[0].GetWorkflowExecution().GetWorkflowId())
-	assert.Empty(t, f.describes[0].GetWorkflowExecution().GetRunId())
-	require.Len(t, f.polls, 1)
-	assert.Equal(t, "wf-1", f.polls[0].GetWorkflowExecution().GetWorkflowId())
-	require.Len(t, f.registers, 1)
-	assert.Equal(t, "wf-1", f.registers[0].GetWorkflowExecution().GetWorkflowId())
-	require.Len(t, f.unregister, 1)
-	assert.Equal(t, "wf-1", f.unregister[0].GetWorkflowExecution().GetWorkflowId())
+	linkedChannelRequests(t, f, workflowExecution("wf-1", "run-9"))
+}
+
+func TestChannel_LinkedToActivity(t *testing.T) {
+	f := &fakeChannelService{
+		describe: &workflowservice.DescribeChannelResponse{
+			Kind:          notificationpb.CHANNEL_KIND_LINKED,
+			LinkedTo:      activityExecution("act-1", ""),
+			RetainedCount: 2,
+			Latest:        &notificationpb.Notification{Channel: "ch", Position: []byte("p2"), Counter: 2},
+		},
+		pollAnswers: [][]*notificationpb.Notification{{{Channel: "ch", Counter: 2}}},
+	}
+	addr := startFakeChannelService(t, f)
+	h := NewCommandHarness(t)
+	linked := []string{"--address", addr, "-c", "ch", "--activity-id", "act-1"}
+
+	res := h.Execute(append([]string{"channel", "notify", "--position", "p2", "--counter", "2",
+		"--run-id", "run-3"}, linked...)...)
+	require.NoError(t, res.Err)
+	h.ContainsOnSameLine(res.Stdout.String(), "Notified channel ch of activity act-1")
+	res = h.Execute(append([]string{"channel", "describe"}, linked...)...)
+	require.NoError(t, res.Err)
+	out := res.Stdout.String()
+	h.ContainsOnSameLine(out, "Kind", "Linked")
+	// The owner line carries no run when the Service names none.
+	h.ContainsOnSameLine(out, "LinkedTo", "activity act-1")
+	assert.NotContains(t, out, "run ")
+	h.ContainsOnSameLine(out, "RetainedCount", "2")
+	res = h.Execute(append([]string{"channel", "poll"}, linked...)...)
+	require.NoError(t, res.Err)
+	res = h.Execute(append([]string{"channel", "listener", "add", "--callback-url",
+		"http://x"}, linked...)...)
+	require.NoError(t, res.Err)
+	h.ContainsOnSameLine(res.Stdout.String(), "to channel ch of activity act-1")
+	res = h.Execute(append([]string{"channel", "listener", "remove", "--listener-id",
+		"listener-7"}, linked...)...)
+	require.NoError(t, res.Err)
+
+	linkedChannelRequests(t, f, activityExecution("act-1", "run-3"))
+
+	// The JSON output carries the owner as the Service sent it.
+	res = h.Execute(append([]string{"channel", "describe", "-o", "json"}, linked...)...)
+	require.NoError(t, res.Err)
+	var described workflowservice.DescribeChannelResponse
+	require.NoError(t, temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &described, true))
+	assert.Equal(t, enumspb.EXECUTION_TYPE_ACTIVITY, described.GetLinkedTo().GetType())
+	assert.Equal(t, "act-1", described.GetLinkedTo().GetBusinessId())
 }
 
 func TestChannel_IndependentByDefault(t *testing.T) {
@@ -724,9 +796,9 @@ func TestChannel_IndependentByDefault(t *testing.T) {
 	res = h.Execute("channel", "describe", "--address", addr, "-c", "ch")
 	require.NoError(t, res.Err)
 	h.ContainsOnSameLine(res.Stdout.String(), "Kind", "Independent")
-	assert.NotContains(t, res.Stdout.String(), "WorkflowId")
-	assert.Nil(t, f.notifies[0].GetWorkflowExecution())
-	assert.Nil(t, f.describes[0].GetWorkflowExecution())
+	assert.NotContains(t, res.Stdout.String(), "LinkedTo")
+	assert.Nil(t, f.notifies[0].GetExecution())
+	assert.Nil(t, f.describes[0].GetExecution())
 }
 
 func TestChannel_LinkedNotFound(t *testing.T) {
@@ -739,6 +811,12 @@ func TestChannel_LinkedNotFound(t *testing.T) {
 	require.Error(t, res.Err)
 	assert.Contains(t, res.Err.Error(), `workflow "gone" has no running execution`)
 	assert.Contains(t, res.Err.Error(), `channel "ch" of workflow "gone"`)
+
+	f.err = serviceerror.NewNotFound("activity execution already completed")
+	res = h.Execute("channel", "describe", "--address", addr, "-c", "ch", "--activity-id", "gone")
+	require.Error(t, res.Err)
+	assert.Contains(t, res.Err.Error(), `activity "gone" has no running execution`)
+	assert.Contains(t, res.Err.Error(), `channel "ch" of activity "gone"`)
 }
 
 // runningWorkflowDescription is a description with what the text output
@@ -894,8 +972,8 @@ func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {
 	s.NoError(res.Err)
 	out := res.Stdout.String()
 	s.ContainsOnSameLine(out, "Kind", "Linked")
-	s.ContainsOnSameLine(out, "WorkflowId", run.GetID())
-	s.ContainsOnSameLine(out, "RunId", run.GetRunID())
+	s.ContainsOnSameLine(out, "LinkedTo",
+		"workflow "+run.GetID()+" (run "+run.GetRunID()+")")
 	s.ContainsOnSameLine(out, "RetainedCount", "1")
 	s.ContainsOnSameLine(out, "LatestPosition", "p1")
 	s.ContainsOnSameLine(out, "Workflow listeners: 1")
@@ -907,7 +985,8 @@ func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {
 	var n notificationpb.Notification
 	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[0], &n, true))
 	s.Equal(int64(1), n.GetCounter())
-	s.Equal(run.GetID(), n.GetLinkedTo().GetWorkflowId())
+	s.Equal(enumspb.EXECUTION_TYPE_WORKFLOW, n.GetLinkedTo().GetType())
+	s.Equal(run.GetID(), n.GetLinkedTo().GetBusinessId())
 
 	res = channel("listener", "add", "--callback-url", "http://127.0.0.1:1/notify", "-o", "json")
 	s.NoError(res.Err)
@@ -937,8 +1016,98 @@ func (s *SharedServerSuite) TestChannel_LinkedToWorkflow() {
 	s.ErrorContains(res.Err, "there is no channel")
 
 	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch, "--run-id", "r")
-	s.ErrorContains(res.Err, "--run-id requires --workflow-id")
+	s.ErrorContains(res.Err, "--run-id requires --workflow-id or --activity-id")
 
 	s.NoError(s.Client.SignalWorkflow(s.Context, run.GetID(), "", "finish", nil))
 	s.NoError(run.Get(s.Context, nil))
+}
+
+func (s *SharedServerSuite) TestChannel_LinkedToActivity() {
+	// The activity stays running until the test is done with its channels.
+	release := make(chan struct{})
+	s.Worker().OnDevActivity(func(ctx context.Context, a any) (any, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil, nil
+	})
+	defer close(release)
+	activityID := "activity-" + uuid.NewString()
+	res := s.Execute("activity", "start", "--address", s.Address(), "-o", "json",
+		"--activity-id", activityID, "--type", "DevActivity",
+		"--task-queue", s.Worker().Options.TaskQueue, "--start-to-close-timeout", "1m")
+	s.NoError(res.Err)
+	var started map[string]any
+	s.NoError(json.Unmarshal(res.Stdout.Bytes(), &started))
+	runID, _ := started["runId"].(string)
+	s.NotEmpty(runID)
+
+	ch := "channel-" + uuid.NewString()
+	linked := []string{"--address", s.Address(), "-c", ch, "--activity-id", activityID}
+	channel := func(args ...string) *CommandResult {
+		return s.Execute(append(append([]string{"channel"}, args...), linked...)...)
+	}
+
+	// The activity does not listen on its own channels, so the notify reaches
+	// nobody and is retained for pollers.
+	res = channel("notify", "--position", "p1", "--counter", "1")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Listeners reached", "0")
+
+	res = channel("describe")
+	s.NoError(res.Err)
+	out := res.Stdout.String()
+	s.ContainsOnSameLine(out, "Kind", "Linked")
+	s.ContainsOnSameLine(out, "LinkedTo", "activity "+activityID+" (run "+runID+")")
+	s.ContainsOnSameLine(out, "RetainedCount", "1")
+	s.ContainsOnSameLine(out, "LatestPosition", "p1")
+	s.ContainsOnSameLine(out, "Workflow listeners: 0")
+
+	res = channel("poll", "--after-counter", "0", "--wait", "5s", "-o", "jsonl")
+	s.NoError(res.Err)
+	raw := decodeJSONValues(s.T(), res.Stdout.String())
+	s.Len(raw, 1)
+	var n notificationpb.Notification
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[0], &n, true))
+	s.Equal(int64(1), n.GetCounter())
+	s.Equal(enumspb.EXECUTION_TYPE_ACTIVITY, n.GetLinkedTo().GetType())
+	s.Equal(activityID, n.GetLinkedTo().GetBusinessId())
+
+	res = channel("listener", "add", "--callback-url", "http://127.0.0.1:1/notify", "-o", "json")
+	s.NoError(res.Err)
+	var added workflowservice.RegisterChannelListenerResponse
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(res.Stdout.Bytes(), &added, true))
+	res = channel("describe")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Callback listeners: 1")
+	res = channel("listener", "remove", "--listener-id", added.GetListenerId())
+	s.NoError(res.Err)
+
+	// The activity's own stream notifies the linked channel named for the
+	// stream alone, as the describe card says it will.
+	res = s.Execute("stream", "append", "--address", s.Address(), "--activity-id", activityID,
+		"--name", "scores", "--input", `{"home": 1}`)
+	s.NoError(res.Err)
+	res = s.Execute("stream", "describe", "--address", s.Address(), "--activity-id", activityID,
+		"--name", "scores")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Channel", "stream/scores")
+	s.ContainsOnSameLine(res.Stdout.String(), "Kind", "Linked")
+	s.ContainsOnSameLine(res.Stdout.String(), "LinkedTo", "activity "+activityID)
+	res = s.Execute("channel", "poll", "--address", s.Address(), "-c", "stream/scores",
+		"--activity-id", activityID, "--after-counter", "0", "--wait", "10s", "-o", "jsonl")
+	s.NoError(res.Err)
+	raw = decodeJSONValues(s.T(), res.Stdout.String())
+	s.NotEmpty(raw)
+	var streamed notificationpb.Notification
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[len(raw)-1], &streamed, true))
+	s.Equal(runID+":1", string(streamed.GetPosition()))
+	s.Equal(enumspb.EXECUTION_TYPE_ACTIVITY, streamed.GetLinkedTo().GetType())
+	s.Equal(activityID, streamed.GetLinkedTo().GetBusinessId())
+
+	// An activity nobody started has no channels to reach.
+	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch,
+		"--activity-id", "never-"+uuid.NewString())
+	s.ErrorContains(res.Err, "has no running execution to reach")
 }

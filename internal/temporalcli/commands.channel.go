@@ -33,28 +33,70 @@ import (
 const channelPollGrace = 10 * time.Second
 
 // channelTarget is the channel a command names: an independent channel by its
-// name alone, or a channel linked to a workflow by the workflow and the name.
+// name alone, or a channel linked to an execution by that owner and the name.
 type channelTarget struct {
 	name      string
-	execution *commonpb.WorkflowExecution
+	execution *commonpb.Execution
 }
 
 func (o *ChannelOptions) target() (channelTarget, error) {
-	if o.RunId != "" && o.WorkflowId == "" {
-		return channelTarget{}, fmt.Errorf("--run-id requires --workflow-id")
+	if o.WorkflowId != "" && o.ActivityId != "" {
+		return channelTarget{}, fmt.Errorf(
+			"--workflow-id and --activity-id name different owners, set one of them")
+	}
+	if o.RunId != "" && o.WorkflowId == "" && o.ActivityId == "" {
+		return channelTarget{}, fmt.Errorf("--run-id requires --workflow-id or --activity-id")
 	}
 	t := channelTarget{name: o.Channel}
-	if o.WorkflowId != "" {
-		t.execution = &commonpb.WorkflowExecution{WorkflowId: o.WorkflowId, RunId: o.RunId}
+	switch {
+	case o.WorkflowId != "":
+		t.execution = &commonpb.Execution{
+			Type:       enumspb.EXECUTION_TYPE_WORKFLOW,
+			BusinessId: o.WorkflowId,
+			RunId:      o.RunId,
+		}
+	case o.ActivityId != "":
+		t.execution = &commonpb.Execution{
+			Type:       enumspb.EXECUTION_TYPE_ACTIVITY,
+			BusinessId: o.ActivityId,
+			RunId:      o.RunId,
+		}
 	}
 	return t, nil
+}
+
+// executionKindText is the owner's kind the way the flags name it, so output
+// reads back as the flag that reaches the same owner.
+func executionKindText(e *commonpb.Execution) string {
+	switch e.GetType() {
+	case enumspb.EXECUTION_TYPE_ACTIVITY:
+		return "activity"
+	case enumspb.EXECUTION_TYPE_NEXUS_OPERATION:
+		return "nexus operation"
+	default:
+		return "workflow"
+	}
+}
+
+// executionText names an execution for a card or a message: its kind and ID,
+// then the run when one was given.
+func executionText(e *commonpb.Execution) string {
+	if e == nil {
+		return ""
+	}
+	text := executionKindText(e) + " " + e.GetBusinessId()
+	if e.GetRunId() != "" {
+		text += " (run " + e.GetRunId() + ")"
+	}
+	return text
 }
 
 func (t channelTarget) String() string {
 	if t.execution == nil {
 		return fmt.Sprintf("channel %q", t.name)
 	}
-	return fmt.Sprintf("channel %q of workflow %q", t.name, t.execution.GetWorkflowId())
+	return fmt.Sprintf("channel %q of %s %q", t.name, executionKindText(t.execution),
+		t.execution.GetBusinessId())
 }
 
 // label is the target for a line of normal output, where quotes would be noise.
@@ -62,7 +104,8 @@ func (t channelTarget) label() string {
 	if t.execution == nil {
 		return "channel " + t.name
 	}
-	return "channel " + t.name + " of workflow " + t.execution.GetWorkflowId()
+	return "channel " + t.name + " of " + executionKindText(t.execution) + " " +
+		t.execution.GetBusinessId()
 }
 
 // plainChannelRefusal turns the Service's refusals into what to do next. Every
@@ -74,9 +117,9 @@ func plainChannelRefusal(err error, t channelTarget) error {
 			"notifies it or a listener registers on it, and goes away after a while "+
 			"with neither.", t.name)
 		if t.execution != nil {
-			plain = fmt.Sprintf("workflow %q has no running execution to reach. A linked "+
-				"channel lives only while its Workflow Execution runs.",
-				t.execution.GetWorkflowId())
+			plain = fmt.Sprintf("%s %q has no running execution to reach. A linked "+
+				"channel lives only while its owner runs.",
+				executionKindText(t.execution), t.execution.GetBusinessId())
 		}
 		return &streamRefusal{plain: plain, detail: notFound.Message, cause: err}
 	}
@@ -245,9 +288,9 @@ func (c *TemporalChannelNotifyCommand) run(cctx *CommandContext, _ []string) err
 			Counter:  int64(c.Counter),
 			Metadata: metadata,
 		},
-		Identity:          c.Parent.Identity,
-		RequestId:         uuid.NewString(),
-		WorkflowExecution: target.execution,
+		Identity:  c.Parent.Identity,
+		RequestId: uuid.NewString(),
+		Execution: target.execution,
 	})
 	if err != nil {
 		return fmt.Errorf("failed notifying %v: %w", target, plainChannelRefusal(err, target))
@@ -273,9 +316,9 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 
 	resp, err := cl.WorkflowService().DescribeChannel(cctx,
 		&workflowservice.DescribeChannelRequest{
-			Namespace:         c.Parent.Namespace,
-			Channel:           c.Channel,
-			WorkflowExecution: target.execution,
+			Namespace: c.Parent.Namespace,
+			Channel:   c.Channel,
+			Execution: target.execution,
 		})
 	if err != nil {
 		return fmt.Errorf("failed describing %v: %w", target, plainChannelRefusal(err, target))
@@ -287,8 +330,7 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 	info := struct {
 		Channel        string
 		Kind           string
-		WorkflowId     string `cli:",cardOmitEmpty"`
-		RunId          string `cli:",cardOmitEmpty"`
+		LinkedTo       string `cli:",cardOmitEmpty"`
 		RetainedCount  int32
 		LatestCounter  int64  `cli:",cardOmitEmpty"`
 		LatestPosition string `cli:",cardOmitEmpty"`
@@ -296,8 +338,7 @@ func (c *TemporalChannelDescribeCommand) run(cctx *CommandContext, _ []string) e
 	}{
 		Channel:       c.Channel,
 		Kind:          channelKindText(resp.GetKind()),
-		WorkflowId:    resp.GetLinkedTo().GetWorkflowId(),
-		RunId:         resp.GetLinkedTo().GetRunId(),
+		LinkedTo:      executionText(resp.GetLinkedTo()),
 		RetainedCount: resp.GetRetainedCount(),
 	}
 	if latest := resp.GetLatest(); latest != nil {
@@ -403,9 +444,9 @@ func (c *TemporalChannelListenerAddCommand) run(cctx *CommandContext, _ []string
 					Header: headers,
 				}},
 			},
-			RequestId:         uuid.NewString(),
-			Identity:          clientOpts.Identity,
-			WorkflowExecution: target.execution,
+			RequestId: uuid.NewString(),
+			Identity:  clientOpts.Identity,
+			Execution: target.execution,
 		})
 	if err != nil {
 		return fmt.Errorf("failed adding a listener to %v: %w",
@@ -432,11 +473,11 @@ func (c *TemporalChannelListenerRemoveCommand) run(cctx *CommandContext, _ []str
 
 	_, err = cl.WorkflowService().UnregisterChannelListener(cctx,
 		&workflowservice.UnregisterChannelListenerRequest{
-			Namespace:         clientOpts.Namespace,
-			Channel:           c.Channel,
-			ListenerId:        c.ListenerId,
-			Identity:          clientOpts.Identity,
-			WorkflowExecution: target.execution,
+			Namespace:  clientOpts.Namespace,
+			Channel:    c.Channel,
+			ListenerId: c.ListenerId,
+			Identity:   clientOpts.Identity,
+			Execution:  target.execution,
 		})
 	if err != nil {
 		return fmt.Errorf("failed removing listener %q from %v: %w",
@@ -485,12 +526,12 @@ func (p *channelPoller) poll() error {
 	ctx, cancel := context.WithTimeout(p.ctx, p.wait+channelPollGrace)
 	defer cancel()
 	resp, err := p.cl.WorkflowService().PollChannel(ctx, &workflowservice.PollChannelRequest{
-		Namespace:         p.namespace,
-		Channel:           p.target.name,
-		AfterCounter:      p.after,
-		Wait:              durationpb.New(p.wait),
-		MaxNotifications:  p.max,
-		WorkflowExecution: p.target.execution,
+		Namespace:        p.namespace,
+		Channel:          p.target.name,
+		AfterCounter:     p.after,
+		Wait:             durationpb.New(p.wait),
+		MaxNotifications: p.max,
+		Execution:        p.target.execution,
 	})
 	p.polled = true
 	if err != nil {

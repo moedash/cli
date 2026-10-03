@@ -100,6 +100,7 @@ func (v *WorkflowReferenceOptions) BuildFlags(f *pflag.FlagSet) {
 type ChannelOptions struct {
 	Channel    string
 	WorkflowId string
+	ActivityId string
 	RunId      string
 	FlagSet    *pflag.FlagSet
 }
@@ -108,8 +109,9 @@ func (v *ChannelOptions) BuildFlags(f *pflag.FlagSet) {
 	v.FlagSet = f
 	f.StringVarP(&v.Channel, "channel", "c", "", "Name of the notification channel. Required.")
 	_ = cobra.MarkFlagRequired(f, "channel")
-	f.StringVarP(&v.WorkflowId, "workflow-id", "w", "", "Workflow ID of the Workflow Execution the channel is linked to. Without it the command uses the independent channel of that name.")
-	f.StringVarP(&v.RunId, "run-id", "r", "", "Run ID of the linked Workflow Execution. Defaults to the current run. Requires --workflow-id.")
+	f.StringVarP(&v.WorkflowId, "workflow-id", "w", "", "Workflow ID of the Workflow Execution the channel is linked to. Without an owner the command uses the independent channel of that name. Cannot use with --activity-id.")
+	f.StringVar(&v.ActivityId, "activity-id", "", "Activity ID of the standalone Activity the channel is linked to. Cannot use with --workflow-id.")
+	f.StringVarP(&v.RunId, "run-id", "r", "", "Run ID of the linked execution. Defaults to the current run. Requires --workflow-id or --activity-id.")
 }
 
 type StreamIdOptions struct {
@@ -1249,9 +1251,9 @@ func NewTemporalChannelCommand(cctx *CommandContext, parent *TemporalCommand) *T
 	s.Command.Use = "channel"
 	s.Command.Short = "Notify and listen on notification channels"
 	if hasHighlighting {
-		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n\x1b[1mtemporal channel [command] [options]\x1b[0m\n\nFor example:\n\n\x1b[1mtemporal channel poll \\\n    --channel YourChannel \\\n    --follow\x1b[0m\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself.\n\nAn independent channel exists on its own, and any number of Workflows,\ncallbacks and clients listen on it. A channel linked to a Workflow\nExecution lives with that Workflow, which listens on it without\nsubscribing; name it with \x1b[1m--workflow-id\x1b[0m on any channel command:\n\n\x1b[1mtemporal channel notify \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId \\\n    --position 42 \\\n    --counter 42\x1b[0m"
+		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n\x1b[1mtemporal channel [command] [options]\x1b[0m\n\nFor example:\n\n\x1b[1mtemporal channel poll \\\n    --channel YourChannel \\\n    --follow\x1b[0m\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself.\n\nAn independent channel exists on its own, and any number of Workflows,\ncallbacks and clients listen on it. A channel linked to a Workflow\nExecution lives with that Workflow, which listens on it without\nsubscribing. A channel linked to a standalone Activity lives with that\nActivity the same way. Name the owner with \x1b[1m--workflow-id\x1b[0m or\n\x1b[1m--activity-id\x1b[0m on any channel command:\n\n\x1b[1mtemporal channel notify \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId \\\n    --position 42 \\\n    --counter 42\x1b[0m"
 	} else {
-		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n```\ntemporal channel [command] [options]\n```\n\nFor example:\n\n```\ntemporal channel poll \\\n    --channel YourChannel \\\n    --follow\n```\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself.\n\nAn independent channel exists on its own, and any number of Workflows,\ncallbacks and clients listen on it. A channel linked to a Workflow\nExecution lives with that Workflow, which listens on it without\nsubscribing; name it with `--workflow-id` on any channel command:\n\n```\ntemporal channel notify \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId \\\n    --position 42 \\\n    --counter 42\n```"
+		s.Command.Long = "A notification channel is a name a writer and its listeners agree on.\nThe writer notifies the channel when a source it writes moves, such as\na Stream gaining records, and never learns who listens. A Workflow\nlistener gets a Workflow Task, a callback listener gets an HTTP call,\nand a client long-polls:\n\n```\ntemporal channel [command] [options]\n```\n\nFor example:\n\n```\ntemporal channel poll \\\n    --channel YourChannel \\\n    --follow\n```\n\nA notification tells listeners where the source stands. It carries no\ndata; the listener reads the source itself.\n\nAn independent channel exists on its own, and any number of Workflows,\ncallbacks and clients listen on it. A channel linked to a Workflow\nExecution lives with that Workflow, which listens on it without\nsubscribing. A channel linked to a standalone Activity lives with that\nActivity the same way. Name the owner with `--workflow-id` or\n`--activity-id` on any channel command:\n\n```\ntemporal channel notify \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId \\\n    --position 42 \\\n    --counter 42\n```"
 	}
 	s.Command.Args = cobra.NoArgs
 	s.Command.AddCommand(&NewTemporalChannelDescribeCommand(cctx, &s).Command)
@@ -1276,9 +1278,9 @@ func NewTemporalChannelDescribeCommand(cctx *CommandContext, parent *TemporalCha
 	s.Command.Use = "describe [flags]"
 	s.Command.Short = "Show a channel's listeners and latest notification"
 	if hasHighlighting {
-		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n\x1b[1mtemporal channel describe \\\n    --channel YourChannel\x1b[0m\n\nAn independent channel exists once a writer notifies it or a listener\nregisters on it, and goes away after a while without listeners or\nactivity. A channel linked to a running Workflow Execution always\nexists:\n\n\x1b[1mtemporal channel describe \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId\x1b[0m"
+		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n\x1b[1mtemporal channel describe \\\n    --channel YourChannel\x1b[0m\n\nAn independent channel exists once a writer notifies it or a listener\nregisters on it, and goes away after a while without listeners or\nactivity. A channel linked to a running Workflow Execution or standalone\nActivity always exists, and its description names that owner:\n\n\x1b[1mtemporal channel describe \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId\x1b[0m"
 	} else {
-		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n```\ntemporal channel describe \\\n    --channel YourChannel\n```\n\nAn independent channel exists once a writer notifies it or a listener\nregisters on it, and goes away after a while without listeners or\nactivity. A channel linked to a running Workflow Execution always\nexists:\n\n```\ntemporal channel describe \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId\n```"
+		s.Command.Long = "Show who listens on a channel, its latest notification, and how many\nnotifications it keeps for pollers:\n\n```\ntemporal channel describe \\\n    --channel YourChannel\n```\n\nAn independent channel exists once a writer notifies it or a listener\nregisters on it, and goes away after a while without listeners or\nactivity. A channel linked to a running Workflow Execution or standalone\nActivity always exists, and its description names that owner:\n\n```\ntemporal channel describe \\\n    --channel YourChannel \\\n    --workflow-id YourWorkflowId\n```"
 	}
 	s.Command.Args = cobra.NoArgs
 	s.ChannelOptions.BuildFlags(s.Command.Flags())

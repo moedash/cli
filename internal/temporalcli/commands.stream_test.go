@@ -72,32 +72,33 @@ func TestStream_DescribeChannel(t *testing.T) {
 	section := channelSection("--stream-id", "scores")
 	h.ContainsOnSameLine(section, "Channel", "stream/scores")
 	h.ContainsOnSameLine(section, "Kind", "Independent")
-	assert.NotContains(t, section, "WorkflowId")
+	assert.NotContains(t, section, "LinkedTo")
 
 	// The owner's default stream has the name the server resolves it to.
 	section = channelSection("--workflow-id", "wf-1")
 	h.ContainsOnSameLine(section, "Channel", "stream/output")
 	h.ContainsOnSameLine(section, "Kind", "Linked")
-	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
-	assert.NotContains(t, section, "RunId")
+	h.ContainsOnSameLine(section, "LinkedTo", "workflow wf-1")
+	assert.NotContains(t, section, "run ")
 
 	section = channelSection("--workflow-id", "wf-1", "--run-id", "run-1", "--name", "scores")
 	h.ContainsOnSameLine(section, "Channel", "stream/scores")
 	h.ContainsOnSameLine(section, "Kind", "Linked")
-	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
-	h.ContainsOnSameLine(section, "RunId", "run-1")
+	h.ContainsOnSameLine(section, "LinkedTo", "workflow wf-1 (run run-1)")
 
+	// An activity the workflow scheduled notifies the workflow, under a name
+	// that carries the activity ID.
 	section = channelSection("--workflow-id", "wf-1", "--activity-id", "act-1", "--name", "scores")
 	h.ContainsOnSameLine(section, "Channel", "stream/act-1/scores")
 	h.ContainsOnSameLine(section, "Kind", "Linked")
-	h.ContainsOnSameLine(section, "WorkflowId", "wf-1")
+	h.ContainsOnSameLine(section, "LinkedTo", "workflow wf-1")
 
-	// A standalone activity has no linked channels, so its stream notifies an
-	// independent one of the same shape.
-	section = channelSection("--activity-id", "act-1", "--name", "scores")
-	h.ContainsOnSameLine(section, "Channel", "stream/act-1/scores")
-	h.ContainsOnSameLine(section, "Kind", "Independent")
-	assert.NotContains(t, section, "WorkflowId")
+	// A standalone activity holds linked channels of its own, so its stream
+	// notifies one named like a workflow's and linked to the activity.
+	section = channelSection("--activity-id", "act-1", "--run-id", "run-2", "--name", "scores")
+	h.ContainsOnSameLine(section, "Channel", "stream/scores")
+	h.ContainsOnSameLine(section, "Kind", "Linked")
+	h.ContainsOnSameLine(section, "LinkedTo", "activity act-1 (run run-2)")
 
 	// The derivation adds no call: each describe reached the service once.
 	st.mu.Lock()

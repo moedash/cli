@@ -54,9 +54,12 @@ stream's lifecycle is its owner's.
   state and reason, retention, caps, budget, producers and consumers. Also
   the notification channel the stream notifies on each append and close,
   derived from the reference alone: `stream/NAME` linked to the owner for a
-  workflow's stream, `stream/ACTIVITY_ID/NAME` for an activity's, and the
-  independent `stream/STREAM_ID` for a standalone stream. `temporal channel
-  poll --channel C [--workflow-id OWNER]` follows it.
+  workflow's or a standalone activity's stream, `stream/ACTIVITY_ID/NAME`
+  linked to the workflow for an activity it scheduled, and the independent
+  `stream/STREAM_ID` for a standalone stream. The card names the owner as
+  `LinkedTo workflow ID` or `LinkedTo activity ID`, with the run when one was
+  given. `temporal channel poll --channel C` with the same `--workflow-id` or
+  `--activity-id` follows it.
 
 `stream read <ref> [--from-offset N | --from-tail | --last N] [--follow]
 [--topic T]... [--limit N]`
@@ -85,6 +88,21 @@ stream state proto for `describe`.
 Authorization follows the server's declaration: `truncate` and `delete` need
 the admin role on the namespace, `list`, `describe` and `read` the read role,
 and the rest the write role.
+
+## Notification channels
+
+`temporal channel notify|describe|poll|listener add|listener remove` reach the
+channel a stream notifies, or any other channel, by `--channel` (`-c`). Without
+an owner the commands use the independent channel of that name. With
+`--workflow-id W` or `--activity-id A`, and an optional `--run-id`, they use
+the channel linked to that Workflow Execution or standalone Activity, sent as
+the request's `execution` with the matching type. The two owner flags cannot
+be combined, and `--run-id` alone is refused.
+
+`channel describe` prints the kind and, for a linked channel, the owner line
+`LinkedTo workflow W (run R)` or `LinkedTo activity A (run R)`, the run only
+when the Service names one. The JSON output carries `linkedTo` as the Service
+sends it.
 
 ## Refusals
 
