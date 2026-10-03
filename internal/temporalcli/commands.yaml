@@ -3619,6 +3619,14 @@ commands:
           --ui-port 3000
       ```
 
+      Streams are enabled on the development server. Turn them off with a
+      dynamic configuration value:
+
+      ```
+      temporal server start-dev \
+          --dynamic-config-value 'stream.enabled=false'
+      ```
+
       Callbacks to `127.0.0.1` and `localhost` on any port are allowed over
       plain HTTP, so a local receiver can listen on a notification channel.
       Replace the list with a dynamic configuration value:
@@ -3709,6 +3717,319 @@ commands:
           Keys must be identifiers, and values must be the search
           attribute type, which is one of the following:
           Text, Keyword, Int, Double, Bool, Datetime, KeywordList.
+
+  - name: temporal stream
+    summary: Read and manage Streams
+    description: |
+      A Stream is an append-only log the Temporal Service carries next to
+      Workflow Executions. A standalone Stream has an ID of its own. An owned
+      Stream lives inside a Workflow Execution or an Activity and is addressed
+      by its owner and a Stream name:
+
+      ```
+      temporal stream [command] [options]
+      ```
+
+      For example:
+
+      ```
+      temporal stream read \
+          --workflow-id YourWorkflowId
+      ```
+
+      The Service must enable Streams for the Namespace through the
+      `stream.enabled` dynamic configuration value. The development server
+      enables them.
+    option-sets:
+      - client
+    docs:
+      description-header: >-
+        Temporal Stream commands list, describe, read, append to, close,
+        truncate and delete the Streams a Temporal Service carries.
+      keywords:
+        - cli reference
+        - command-line-interface-cli
+        - stream
+        - stream append
+        - stream close
+        - stream create
+        - stream delete
+        - stream describe
+        - stream list
+        - stream read
+        - stream truncate
+        - streams
+        - temporal cli
+      tags:
+        - Temporal CLI
+        - Streams
+
+  - name: temporal stream append
+    summary: Append records to a Stream
+    description: |
+      Append one or more records to a Stream. Each `--input` is one record.
+      Without `--input` or `--input-file`, one record is read per line from
+      stdin:
+
+      ```
+      temporal stream append \
+          --stream-id YourStreamId \
+          --input '{"score": 1}' \
+          --input '{"score": 2}'
+      ```
+
+      Append to a Stream a Workflow Execution owns, naming the owner instead:
+
+      ```
+      temporal stream append \
+          --workflow-id YourWorkflowId \
+          --name scores \
+          --input '{"score": 1}'
+      ```
+
+      Set `--producer-id` and `--sequence` so a retried append is deduplicated
+      rather than appended twice. Pass `--finish` to end the producer's writes
+      on the topic with a `FINISH` record after the values.
+    options:
+      - name: topic
+        type: string
+        description: Topic label stored on every record.
+      - name: producer-id
+        type: string
+        description: |
+          Producer identity stored on every record.
+          Together with --sequence it deduplicates a retried append.
+      - name: attempt
+        type: int
+        description: Producer attempt stored on every record.
+      - name: sequence
+        type: int
+        description: |
+          Sequence of the first record within the producer's attempt.
+          Records that follow take the next numbers.
+      - name: expected-offset
+        type: int
+        description: |
+          Refuse the append unless the Stream's next offset equals this value.
+          Only applies to a standalone Stream.
+      - name: finish
+        type: bool
+        description: Append a `FINISH` record after the values.
+    option-sets:
+      - stream-reference
+      - payload-input
+
+  - name: temporal stream close
+    summary: Close a Stream
+    description: |
+      Close a standalone Stream. A closed Stream accepts no more records and
+      stays readable until its retention passes:
+
+      ```
+      temporal stream close \
+          --stream-id YourStreamId \
+          --reason "done"
+      ```
+    options:
+      - name: reason
+        type: string
+        description: Reason recorded on the Stream.
+    option-sets:
+      - stream-id
+
+  - name: temporal stream create
+    summary: Create a standalone Stream
+    description: |
+      Create a standalone Stream with an ID of its own:
+
+      ```
+      temporal stream create \
+          --stream-id YourStreamId
+      ```
+
+      Records older than `--retention` are reclaimed, and a closed Stream is
+      deleted once it passes. Without it the Namespace's retention applies.
+      Creating a Stream that already exists with the same lifecycle is an
+      idempotent retry; a different lifecycle is refused.
+    options:
+      - name: retention
+        type: duration
+        description: |
+          How long a record stays readable, and how long a closed Stream
+          stays readable before it is deleted.
+          Cannot be longer than the Namespace's retention.
+      - name: max-items
+        type: int
+        description: |
+          Most records the Stream holds before the oldest are reclaimed.
+          Default is zero (unbounded).
+      - name: max-bytes
+        type: int
+        description: |
+          Most bytes the Stream holds. An append past it is refused until
+          records are reclaimed. Default is zero (unbounded).
+    option-sets:
+      - stream-id
+
+  - name: temporal stream delete
+    summary: Remove a Stream
+    description: |
+      Delete a standalone Stream and every record it holds:
+
+      ```
+      temporal stream delete \
+          --stream-id YourStreamId
+      ```
+
+      The call is refused while a Workflow Execution consumes the Stream,
+      because its replay depends on the records. Pass `--force` to delete it
+      anyway.
+    options:
+      - name: force
+        type: bool
+        description: Delete even while a Workflow Execution consumes the Stream.
+    option-sets:
+      - stream-id
+
+  - name: temporal stream describe
+    summary: Show a Stream's state
+    description: |
+      Show a Stream's frontier, floor, close state, retention, producers and
+      consumers:
+
+      ```
+      temporal stream describe \
+          --stream-id YourStreamId
+      ```
+
+      Describe a Stream a Workflow Execution owns:
+
+      ```
+      temporal stream describe \
+          --workflow-id YourWorkflowId \
+          --name scores
+      ```
+
+      The output also names the notification channel the Stream notifies on
+      each append and on its close. The name follows from the Stream alone,
+      so no call to the Service is needed. A Stream a Workflow Execution
+      owns notifies `stream/NAME`, linked to the owner. A Stream of an
+      Activity the Workflow scheduled notifies `stream/ACTIVITY_ID/NAME`,
+      linked to the owner too. A standalone Stream notifies the independent
+      channel `stream/STREAM_ID`. Pass the channel, and the owner of a
+      linked one, to `temporal channel poll` to follow the Stream:
+
+      ```
+      temporal channel poll \
+          --channel stream/scores \
+          --workflow-id YourWorkflowId
+      ```
+    option-sets:
+      - stream-reference
+
+  - name: temporal stream list
+    summary: Show standalone Streams
+    description: |
+      List the standalone Streams in a Namespace. The optional `--query`
+      limits the output to Streams matching a List Filter, where `WorkflowId`
+      holds the Stream ID:
+
+      ```
+      temporal stream list \
+          --query 'WorkflowId STARTS_WITH "scores-"'
+      ```
+
+      Streams a Workflow Execution owns are not listed here. Describe or read
+      them through their owner.
+    options:
+      - name: query
+        short: q
+        type: string
+        description: Content for an SQL-like `QUERY` List Filter.
+      - name: limit
+        type: int
+        description: Maximum number of Streams to display.
+      - name: page-size
+        type: int
+        description: Maximum number of Streams to fetch at a time from the server.
+        default: 100
+
+  - name: temporal stream read
+    summary: Read a Stream's records
+    description: |
+      Read a Stream from the beginning and stop once caught up:
+
+      ```
+      temporal stream read \
+          --stream-id YourStreamId
+      ```
+
+      Read a Stream a Workflow Execution owns and keep following it as records
+      land:
+
+      ```
+      temporal stream read \
+          --workflow-id YourWorkflowId \
+          --name scores \
+          --follow
+      ```
+
+      Start at a cursor with `--from-offset`, at the tail with `--from-tail`,
+      or at the newest records with `--last`. Each record prints with its
+      offset, kind, topic, producer, attempt, sequence and body. With
+      `--output json` each record is one JSON object.
+    options:
+      - name: from-offset
+        type: int
+        description: |
+          Offset to start at, inclusive.
+          Refused when below the Stream's floor.
+      - name: from-tail
+        type: bool
+        description: Start at the tail and show only records appended from now on.
+      - name: last
+        type: int
+        description: Start at the newest records, showing at most this many first.
+      - name: follow
+        short: f
+        type: bool
+        description: Keep reading as records land, until the Stream closes.
+      - name: topic
+        type: string[]
+        description: |
+          Show only records on this topic.
+          Can be passed multiple times.
+      - name: limit
+        type: int
+        description: Maximum number of records to display.
+      - name: page-size
+        type: int
+        description: Maximum number of records to fetch at a time from the server.
+        default: 100
+    option-sets:
+      - stream-reference
+
+  - name: temporal stream truncate
+    summary: Drop the oldest records of a Stream
+    description: |
+      Move the readable floor of a standalone Stream up to an offset. Records
+      below it are gone:
+
+      ```
+      temporal stream truncate \
+          --stream-id YourStreamId \
+          --to 100
+      ```
+
+      The call is refused while a Workflow Execution consumes records below
+      the new floor.
+    options:
+      - name: to
+        type: int
+        description: New floor. Records below this offset are dropped.
+        required: true
+    option-sets:
+      - stream-id
 
   - name: temporal task-queue
     summary: Manage Task Queues
@@ -5664,6 +5985,46 @@ option-sets:
         description: |
           Run ID of the linked execution.
           Defaults to the current run. Requires --workflow-id or --activity-id.
+
+  - name: stream-id
+    options:
+      - name: stream-id
+        type: string
+        short: s
+        description: Stream ID of a standalone Stream.
+        required: true
+
+  - name: stream-reference
+    options:
+      - name: stream-id
+        type: string
+        short: s
+        description: |
+          Stream ID of a standalone Stream.
+          You must set either --stream-id or an owner.
+      - name: workflow-id
+        type: string
+        short: w
+        description: |
+          Workflow ID of the Workflow Execution owning the Stream.
+          Cannot use with --stream-id.
+      - name: run-id
+        type: string
+        short: r
+        description: |
+          Run ID of the owner.
+          Defaults to the current run.
+      - name: activity-id
+        type: string
+        description: |
+          Activity ID of the Activity owning the Stream.
+          With --workflow-id it names an Activity the Workflow scheduled.
+          On its own it names a standalone Activity.
+      - name: name
+        type: string
+        description: |
+          Name of the Stream within its owner.
+          Defaults to the owner's default Stream.
 
   - name: deployment-name
     options:

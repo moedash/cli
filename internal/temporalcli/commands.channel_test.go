@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
+	streampb "go.temporal.io/server/chasm/lib/stream/gen/streampb/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -144,6 +145,14 @@ func (f *fakeChannelService) PollChannel(
 }
 
 func startFakeChannelService(t *testing.T, f *fakeChannelService) string {
+	return startFakeServices(t, f, nil)
+}
+
+// startFakeServices serves a fake workflow service and, when given, a fake
+// stream service on one address, the way the Service's frontend does.
+func startFakeServices(
+	t *testing.T, wf workflowservice.WorkflowServiceServer, st streampb.StreamServiceServer,
+) string {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	// The Service sends its errors as gRPC statuses; a bare server would send
@@ -157,7 +166,10 @@ func startFakeChannelService(t *testing.T, f *fakeChannelService) string {
 		}
 		return resp, nil
 	}))
-	workflowservice.RegisterWorkflowServiceServer(srv, f)
+	workflowservice.RegisterWorkflowServiceServer(srv, wf)
+	if st != nil {
+		streampb.RegisterStreamServiceServer(srv, st)
+	}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(srv.Stop)
 	return ln.Addr().String()
@@ -1071,6 +1083,28 @@ func (s *SharedServerSuite) TestChannel_LinkedToActivity() {
 	s.ContainsOnSameLine(res.Stdout.String(), "Callback listeners: 1")
 	res = channel("listener", "remove", "--listener-id", added.GetListenerId())
 	s.NoError(res.Err)
+
+	// The activity's own stream notifies the linked channel named for the
+	// stream alone, as the describe card says it will.
+	res = s.Execute("stream", "append", "--address", s.Address(), "--activity-id", activityID,
+		"--name", "scores", "--input", `{"home": 1}`)
+	s.NoError(res.Err)
+	res = s.Execute("stream", "describe", "--address", s.Address(), "--activity-id", activityID,
+		"--name", "scores")
+	s.NoError(res.Err)
+	s.ContainsOnSameLine(res.Stdout.String(), "Channel", "stream/scores")
+	s.ContainsOnSameLine(res.Stdout.String(), "Kind", "Linked")
+	s.ContainsOnSameLine(res.Stdout.String(), "LinkedTo", "activity "+activityID)
+	res = s.Execute("channel", "poll", "--address", s.Address(), "-c", "stream/scores",
+		"--activity-id", activityID, "--after-counter", "0", "--wait", "10s", "-o", "jsonl")
+	s.NoError(res.Err)
+	raw = decodeJSONValues(s.T(), res.Stdout.String())
+	s.NotEmpty(raw)
+	var streamed notificationpb.Notification
+	s.NoError(temporalcli.UnmarshalProtoJSONWithOptions(raw[len(raw)-1], &streamed, true))
+	s.Equal(runID+":1", string(streamed.GetPosition()))
+	s.Equal(enumspb.EXECUTION_TYPE_ACTIVITY, streamed.GetLinkedTo().GetType())
+	s.Equal(activityID, streamed.GetLinkedTo().GetBusinessId())
 
 	// An activity nobody started has no channels to reach.
 	res = s.Execute("channel", "describe", "--address", s.Address(), "-c", ch,
