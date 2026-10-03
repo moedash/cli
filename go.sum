@@ -334,10 +334,10 @@ github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJ
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee h1:W5t00kpgFdJifH4BDsTlE89Zl93FEloxaWZfGcifgq8=
 github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
-github.com/moedash/api-go v1.63.6-0.20261003080812-cc8cb1b67d9a h1:3ewglu5lF3kSjC+Hc7vI53mMyHfxut+94CE5aOpCKVI=
-github.com/moedash/api-go v1.63.6-0.20261003080812-cc8cb1b67d9a/go.mod h1:acM0I9WPuYg8W3Pd9jOZvEgi7mRUttUQ4+e7fowKVnM=
-github.com/moedash/temporal v0.0.0-20261003091522-843ae6ddd7e3 h1:IRRx+amz1ic1iMpwL+7YiwPd3x3SEfdQWEZJauqbV94=
-github.com/moedash/temporal v0.0.0-20261003091522-843ae6ddd7e3/go.mod h1:y2sC//Sn5NSNGE3PG5p1gTaEzXcG58LIcQhHYJt4T1I=
+github.com/moedash/api-go v1.63.6-0.20261003081321-4fbd53e98c9c h1:TJ4rk/V8LBATt9c8YeLsib3ZOjKuKBkRA/lFXXPn9aE=
+github.com/moedash/api-go v1.63.6-0.20261003081321-4fbd53e98c9c/go.mod h1:acM0I9WPuYg8W3Pd9jOZvEgi7mRUttUQ4+e7fowKVnM=
+github.com/moedash/temporal v0.0.0-20261003102825-3aacb7a982a8 h1:aN0zuGWzKjcWZZ0xR278mwvUUjZCl+hsHIu1W821Cm0=
+github.com/moedash/temporal v0.0.0-20261003102825-3aacb7a982a8/go.mod h1:Vdv1EatpdvoT1f6b/FnHxjmhzD2V3td5W0gxSqrVyKw=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
