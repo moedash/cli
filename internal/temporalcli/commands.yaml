@@ -3618,6 +3618,15 @@ commands:
       temporal server start-dev \
           --ui-port 3000
       ```
+
+      Callbacks to `127.0.0.1` and `localhost` on any port are allowed over
+      plain HTTP, so a local receiver can listen on a notification channel.
+      Replace the list with a dynamic configuration value:
+
+      ```
+      temporal server start-dev \
+          --dynamic-config-value 'callback.allowedAddresses=[]'
+      ```
     options:
       - name: db-filename
         short: f
